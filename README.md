@@ -1,4 +1,4 @@
-# QwenFuse：基于 vLLM 的算子与 KV Cache 调度优化
+# vLLM Inference Optimization：基于 vLLM 的算子与 KV Cache 调度优化
 
 面向 Qwen3-8B BF16 推理，从 Attention 前处理和请求准入两部分改进执行效率：融合 QK RMSNorm、RoPE 与 KV Cache 写入，在多 head/warp 分支预加载 cos/sin，并根据潜在前缀缓存淘汰风险调整等待队列的准入顺序。
 
