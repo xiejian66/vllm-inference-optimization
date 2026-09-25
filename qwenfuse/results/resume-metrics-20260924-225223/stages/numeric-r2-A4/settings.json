@@ -1,0 +1,55 @@
+{
+  "model": "/root/data/qwenfuse/models/Qwen3-8B",
+  "dtype": "bfloat16",
+  "quantization": null,
+  "kv_cache_dtype": "auto",
+  "tensor_parallel_size": 1,
+  "seed": 42,
+  "max_model_len": 4096,
+  "max_num_seqs": 32,
+  "max_num_batched_tokens": 2048,
+  "block_size": 16,
+  "kv_cache_memory_bytes": 8589934592,
+  "enable_prefix_caching": false,
+  "enable_chunked_prefill": true,
+  "async_scheduling": false,
+  "scheduling_policy": "fcfs",
+  "enforce_eager": false,
+  "skip_tokenizer_init": true,
+  "generation_config": "vllm",
+  "disable_log_stats": false,
+  "attention_config": {
+    "backend": "FLASH_ATTN",
+    "flash_attn_version": 2
+  },
+  "compilation_config": {
+    "mode": 3,
+    "compile_ranges_endpoints": [
+      256,
+      4096
+    ],
+    "cudagraph_mode": "PIECEWISE",
+    "cudagraph_capture_sizes": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "use_inductor_graph_partition": true,
+    "pass_config": {
+      "enable_qk_norm_rope_fusion": true,
+      "fuse_qk_norm_rope_kvcache": false,
+      "fuse_rope_kvcache": false,
+      "rope_kvcache_fusion_max_token_num": 256
+    }
+  },
+  "logprobs_mode": "raw_logits",
+  "max_logprobs": -1,
+  "profiler_config": {
+    "profiler": "torch",
+    "torch_profiler_dir": "/root/data/qwenfuse/reports/resume-metrics-20260924-225223/stages/numeric-r2-A4/trace",
+    "torch_profiler_with_stack": false
+  }
+}

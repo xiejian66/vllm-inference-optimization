@@ -1,0 +1,2449 @@
+diff --git a/csrc/libtorch_stable/fused_qknorm_rope_kernel.cu b/csrc/libtorch_stable/fused_qknorm_rope_kernel.cu
+index 01bad79cd8..96bdfe945b 100644
+--- a/csrc/libtorch_stable/fused_qknorm_rope_kernel.cu
++++ b/csrc/libtorch_stable/fused_qknorm_rope_kernel.cu
+@@ -99,8 +99,27 @@ using namespace vllm::cuda_async;
+ // scalar_t_cache: data type of cos/sin cache
+ // head_dim: the dimension of each head
+ // interleave: interleave=!is_neox.
++// Destinations for the cache-writing variant (WRITE_CACHE == true). In that
++// mode the kernel never writes back into `qkv`: normalised/rotated Q and K go
++// to the contiguous q_out / k_out tensors, and K and V are additionally
++// scattered into the paged KV cache (flash layout, may be strided) using
++// slot_mapping. Tokens beyond num_slot_tokens or with a negative slot are
++// processed but not cached, matching reshape_and_cache_flash.
++struct KVCacheWriteParams {
++  void* q_out = nullptr;      // [num_tokens, num_heads_q, head_dim]
++  void* k_out = nullptr;      // [num_tokens, num_heads_k, head_dim]
++  void* key_cache = nullptr;  // [num_blocks, block_size, num_heads_k, head_dim]
++  void* value_cache =
++      nullptr;  // [num_blocks, block_size, num_heads_v, head_dim]
++  int64_t const* slot_mapping = nullptr;
++  int num_slot_tokens = 0;
++  int block_size = 1;
++  int64_t kc_stride_b = 0, kc_stride_s = 0, kc_stride_h = 0;
++  int64_t vc_stride_b = 0, vc_stride_s = 0, vc_stride_h = 0;
++};
++
+ template <typename scalar_t_in, typename scalar_t_cache, int head_dim,
+-          bool interleave>
++          bool interleave, bool WRITE_CACHE>
+ __global__ void fusedQKNormRopeKernel(
+     void* qkv_void,                  // Combined QKV tensor
+     int const num_heads_q,           // Number of query heads
+@@ -112,7 +131,8 @@ __global__ void fusedQKNormRopeKernel(
+     void const* cos_sin_cache_void,  // Pre-computed cos/sin cache
+     int64_t const* position_ids,     // Position IDs for RoPE
+     int const num_tokens,            // Number of tokens
+-    int const rotary_dim             // Dimension for RoPE
++    int const rotary_dim,            // Dimension for RoPE
++    KVCacheWriteParams const cw      // Only read when WRITE_CACHE
+ ) {
+ #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+   if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
+@@ -148,8 +168,10 @@ __global__ void fusedQKNormRopeKernel(
+     // processes
+     int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+ 
+-    // Total number of attention heads (Q and K)
+-    int const total_qk_heads = num_heads_q + num_heads_k;
++    // Total number of attention heads (Q and K; plus V when writing the cache)
++    int const total_qk_heads = WRITE_CACHE
++                                   ? num_heads_q + num_heads_k + num_heads_v
++                                   : num_heads_q + num_heads_k;
+ 
+     // Determine which token and head type (Q or K) this warp processes
+     int const tokenIdx = globalWarpIdx / total_qk_heads;
+@@ -195,6 +217,28 @@ __global__ void fusedQKNormRopeKernel(
+     cudaGridDependencySynchronize();
+ #endif
+ 
++    if constexpr (WRITE_CACHE) {
++      if (localHeadIdx >= num_heads_q + num_heads_k) {
++        // V head: no norm / rope, just scatter into the paged value cache.
++        // offsetThread already points at this V head (headIdx counts on from
++        // the K heads, so the K offset formula covers the V block).
++        if (tokenIdx < cw.num_slot_tokens) {
++          int64_t const slot = cw.slot_mapping[tokenIdx];
++          if (slot >= 0) {
++            int const vHead = localHeadIdx - num_heads_q - num_heads_k;
++            T_in* value_cache = reinterpret_cast<T_in*>(cw.value_cache);
++            int64_t const dst = (slot / cw.block_size) * cw.vc_stride_b +
++                                (slot % cw.block_size) * cw.vc_stride_s +
++                                vHead * cw.vc_stride_h +
++                                laneId * numElemsPerThread;
++            *reinterpret_cast<vec_T*>(&value_cache[dst]) =
++                *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
++          }
++        }
++        return;
++      }
++    }
++
+     // Sum of squares for RMSNorm
+     float sumOfSquares = 0.0f;
+ 
+@@ -243,6 +287,15 @@ __global__ void fusedQKNormRopeKernel(
+     T_cache const* cos_ptr = cache_ptr;
+     T_cache const* sin_ptr = cache_ptr + embed_dim;
+     int const rotary_lanes = rotary_dim / numElemsPerThread;  // rotary range
++    if constexpr (!interleave) {
++      // Exchange with the whole warp: rotary_lanes < 32 when rotary_dim <
++      // head_dim, so shuffling inside the lane guard below would be UB.
++      int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
++#pragma unroll
++      for (int i = 0; i < numElemsPerThread; i++) {
++        elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
++      }
++    }
+     if (laneId < rotary_lanes) {
+       if constexpr (interleave) {
+         // Perform interleaving. Use pre-computed cos/sin values.
+@@ -266,15 +319,10 @@ __global__ void fusedQKNormRopeKernel(
+           elements[idx1] = val0 * sin_val + val1 * cos_val;
+         }
+       } else {
+-        // Before data exchange with in warp, we need to sync.
+-        __syncwarp();
+-        int pairOffset = (rotary_dim / 2) / numElemsPerThread;
+-        // Get the data from the other half of the warp. Use pre-computed
+-        // cos/sin values.
++        int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
++        // Use pre-computed cos/sin values.
+ #pragma unroll
+         for (int i = 0; i < numElemsPerThread; i++) {
+-          elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
+-
+           if (laneId < pairOffset) {
+             elements2[i] = -elements2[i];
+           }
+@@ -287,8 +335,6 @@ __global__ void fusedQKNormRopeKernel(
+ 
+           elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
+         }
+-        // __shfl_xor_sync does not provide memfence. Need to sync again.
+-        __syncwarp();
+       }
+     }
+     // Store.
+@@ -303,7 +349,27 @@ __global__ void fusedQKNormRopeKernel(
+         // Place it into the generic vector
+         *(reinterpret_cast<T2_in*>(&vec) + i) = packed_val;
+       }
+-      *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
++      if constexpr (WRITE_CACHE) {
++        T_in* out = reinterpret_cast<T_in*>(isQ ? cw.q_out : cw.k_out);
++        int const out_heads = isQ ? num_heads_q : num_heads_k;
++        int64_t const out_off =
++            (static_cast<int64_t>(tokenIdx) * out_heads + headIdx) * head_dim +
++            laneId * numElemsPerThread;
++        *reinterpret_cast<vec_T*>(&out[out_off]) = vec;
++        if (!isQ && tokenIdx < cw.num_slot_tokens) {
++          int64_t const slot = cw.slot_mapping[tokenIdx];
++          if (slot >= 0) {
++            T_in* key_cache = reinterpret_cast<T_in*>(cw.key_cache);
++            int64_t const dst = (slot / cw.block_size) * cw.kc_stride_b +
++                                (slot % cw.block_size) * cw.kc_stride_s +
++                                headIdx * cw.kc_stride_h +
++                                laneId * numElemsPerThread;
++            *reinterpret_cast<vec_T*>(&key_cache[dst]) = vec;
++          }
++        }
++      } else {
++        *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
++      }
+     }
+ 
+     // PDL: signal completion so a dependent successor may launch early.
+@@ -316,17 +382,16 @@ __global__ void fusedQKNormRopeKernel(
+ #endif
+ }
+ 
+-// Multi-token-head kernel: one warp processes HEADS_PER_WARP token-heads for
+-// the same token, sharing cos/sin from shared memory via cp.async.
+-// When HEADS_PER_WARP > 1 the warp reuses the loaded cos/sin across all heads,
+-// hiding global-memory latency and improving occupancy for large batches.
++// Multi-token-head kernel: QKV in shared memory, cos/sin in registers.
++// Preload cos/sin into registers in the multi-head KV-writing path.
+ template <typename scalar_t_in, typename scalar_t_cache, int head_dim,
+-          bool interleave, int HEADS_PER_WARP>
++          bool interleave, int HEADS_PER_WARP, bool WRITE_CACHE>
+ __global__ void fusedQKNormRopeKernelNTokenHeads(
+     void* qkv_void, int const num_heads_q, int const num_heads_k,
+     int const num_heads_v, float const eps, void const* q_weight_void,
+     void const* k_weight_void, void const* cos_sin_cache_void,
+-    int64_t const* position_ids, int const num_tokens, int const rotary_dim) {
++    int64_t const* position_ids, int const num_tokens, int const rotary_dim,
++    KVCacheWriteParams const cw) {
+ #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+   if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
+                 std::is_same_v<scalar_t_cache, c10::BFloat16>) {
+@@ -348,12 +413,7 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+     using T_cache = typename CacheConverter::hip_type;
+ 
+     extern __shared__ char smem_storage[];
+-    // Shared memory layout:
+-    //   [0, cos_sin_bytes)           : cos/sin for each warp  (warpsPerBlock *
+-    //   rotary_dim * sizeof(T_cache))
+-    // [cos_sin_bytes, ...)         : QKV tiles
+-    //   per warp     (warpsPerBlock * HEADS_PER_WARP * 32 * elemSizeBytes)
+-    T_cache* const smem = reinterpret_cast<T_cache*>(smem_storage);
++    // Shared memory contains QKV tiles only.
+ 
+     T_in* qkv = reinterpret_cast<T_in*>(qkv_void);
+     T_in const* q_weight = reinterpret_cast<T_in const*>(q_weight_void);
+@@ -365,8 +425,9 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+     int const warpId = threadIdx.x / 32;
+     int const laneId = threadIdx.x % 32;
+ 
+-    int const total_qk_heads = num_heads_q + num_heads_k;
+     int const num_heads = num_heads_q + num_heads_k + num_heads_v;
++    int const total_qk_heads =
++        WRITE_CACHE ? num_heads : num_heads_q + num_heads_k;
+     int const head_chunks_per_token =
+         (total_qk_heads + HEADS_PER_WARP - 1) / HEADS_PER_WARP;
+ 
+@@ -389,12 +450,9 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+     constexpr int vecSize = elemSizeBytes / 4;
+     using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+ 
+-    int const cos_sin_bytes =
+-        warpsPerBlock * rotary_dim * static_cast<int>(sizeof(T_cache));
+     int const qkv_tile_bytes = 32 * elemSizeBytes;
+     char* const this_warp_head_smem =
+-        smem_storage + cos_sin_bytes +
+-        warpId * (HEADS_PER_WARP * qkv_tile_bytes);
++        smem_storage + warpId * (HEADS_PER_WARP * qkv_tile_bytes);
+ 
+     // PDL: wait for the predecessor kernel (the QKV projection that produces
+     // `qkv`) to complete before touching any global memory -- cp.async reads
+@@ -424,29 +482,36 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+     }
+     cp_async_commit_group();  // commit group 0 (QKV)
+ 
+-    // === Group 1: async load cos/sin into smem (issued second). ===
++    // Preload cos/sin after committing the QKV async copy.
+     int64_t const pos_id = position_ids[tokenIdx];
+-    T_cache const* const cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+-    int const copy_bytes = rotary_dim * static_cast<int>(sizeof(T_cache));
+-    int const num_copies = (copy_bytes + 15) / 16;
+-    for (int copyId = laneId; copyId < num_copies; copyId += 32) {
+-      char* smem_ptr =
+-          reinterpret_cast<char*>(&smem[warpId * rotary_dim]) + copyId * 16;
+-      const char* glob_ptr =
+-          reinterpret_cast<const char*>(cache_ptr) + copyId * 16;
+-      cp_async_shared_global_16_cg(smem_ptr, glob_ptr);
++    int const rotary_lanes = rotary_dim / numElemsPerThread;
++    int const embed_dim = rotary_dim / 2;
++    T_cache const* const cos_ptr = cos_sin_cache + pos_id * rotary_dim;
++    T_cache const* const sin_ptr = cos_ptr + embed_dim;
++    float r_cos[numElemsPerThread];
++    float r_sin[numElemsPerThread];
++    if (laneId < rotary_lanes) {
++      if constexpr (interleave) {
++#pragma unroll
++        for (int i = 0; i < numElemsPerThread / 2; ++i) {
++          int const half_dim = (laneId * numElemsPerThread + 2 * i) / 2;
++          r_cos[i] = CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
++          r_sin[i] = CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
++        }
++      } else {
++#pragma unroll
++        for (int i = 0; i < numElemsPerThread; ++i) {
++          int const dim_idx = ((laneId * numElemsPerThread + i) * 2) % rotary_dim;
++          int const half_dim = dim_idx / 2;
++          r_cos[i] = CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
++          r_sin[i] = CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
++        }
++      }
+     }
+-    cp_async_commit_group();  // commit group 1 (cos/sin)
+-
+-    // wait<1>: allow at most 1 pending group (group 1) → group 0 (QKV) is done.
+-    cp_async_wait_group<1>();
+-
++    // Only the QKV async group remains. Finish before reading shared memory.
++    cp_async_wait_group<0>();
+     float elements[numElemsPerThread];
+     float elements2[numElemsPerThread];
+-    int const rotary_lanes = rotary_dim / numElemsPerThread;
+-    int const embed_dim = rotary_dim / 2;
+-    T_cache const* const cos_smem = &smem[warpId * rotary_dim];
+-    T_cache const* const sin_smem = &smem[warpId * rotary_dim + embed_dim];
+ 
+     // Preload weights into registers once, reused across all heads.
+     float q_w[numElemsPerThread];
+@@ -472,6 +537,28 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+       }
+       int const offsetThread = offsetWarp + laneId * numElemsPerThread;
+ 
++      if constexpr (WRITE_CACHE) {
++        if (localHeadIdx >= num_heads_q + num_heads_k) {
++          // V head: copy the prefetched tile into the paged value cache.
++          if (tokenIdx < cw.num_slot_tokens) {
++            int64_t const slot = cw.slot_mapping[tokenIdx];
++            if (slot >= 0) {
++              char const* smem_src = this_warp_head_smem + k * qkv_tile_bytes +
++                                     laneId * elemSizeBytes;
++              vec_T const vec = *reinterpret_cast<vec_T const*>(smem_src);
++              int const vHead = localHeadIdx - num_heads_q - num_heads_k;
++              T_in* value_cache = reinterpret_cast<T_in*>(cw.value_cache);
++              int64_t const dst = (slot / cw.block_size) * cw.vc_stride_b +
++                                  (slot % cw.block_size) * cw.vc_stride_s +
++                                  vHead * cw.vc_stride_h +
++                                  laneId * numElemsPerThread;
++              *reinterpret_cast<vec_T*>(&value_cache[dst]) = vec;
++            }
++          }
++          continue;
++        }
++      }
++
+       // === Part 1: QK Norm (read from smem; group 0 already done). ===
+       float sumOfSquares = 0.0f;
+       {
+@@ -498,40 +585,42 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+         elements[i] *= rms_rcp * (isQ ? q_w[i] : k_w[i]);
+       }
+ 
+-      // On first head: wait for group 1 (cos/sin) before RoPE.
+-      if (k == 0) cp_async_wait_group<0>();
+-
+-      // === Part 2: RoPE using cos/sin from shared memory. ===
++      // === Part 2: RoPE using register-loaded cos/sin. ===
++      if constexpr (!interleave) {
++        // Whole-warp exchange, see the single-head kernel above.
++        int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
++#pragma unroll
++        for (int i = 0; i < numElemsPerThread; i++) {
++          elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
++        }
++      }
+       if (laneId < rotary_lanes) {
+         if constexpr (interleave) {
+ #pragma unroll
+           for (int i = 0; i < numElemsPerThread / 2; ++i) {
+             int const idx0 = 2 * i;
+             int const idx1 = 2 * i + 1;
+-            int const dim_idx = laneId * numElemsPerThread + idx0;
+             float const val0 = elements[idx0];
+             float const val1 = elements[idx1];
+-            int const half_dim = dim_idx / 2;
+-            float const cos_val = CacheConverter::convert(cos_smem[half_dim]);
+-            float const sin_val = CacheConverter::convert(sin_smem[half_dim]);
++            float const cos_val = r_cos[i];
++            float const sin_val = r_sin[i];
+             elements[idx0] = val0 * cos_val - val1 * sin_val;
+-            elements[idx1] = val0 * sin_val + val1 * cos_val;
++            // Preserve the baseline interleaved RoPE rounding order:
++            // round val0*sin first, then fuse val1*cos + that product.
++            // Register preloading otherwise lets NVCC choose the opposite
++            // contraction, changing FP16 results near a rounding midpoint.
++            elements[idx1] =
++                __fmaf_rn(val1, cos_val, __fmul_rn(val0, sin_val));
+           }
+         } else {
+-          __syncwarp();
+           int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
+ #pragma unroll
+           for (int i = 0; i < numElemsPerThread; i++) {
+-            elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
+             if (laneId < pairOffset) elements2[i] = -elements2[i];
+-            int dim_idx = laneId * numElemsPerThread + i;
+-            dim_idx = (dim_idx * 2) % rotary_dim;
+-            int const half_dim = dim_idx / 2;
+-            float const cos_val = CacheConverter::convert(cos_smem[half_dim]);
+-            float const sin_val = CacheConverter::convert(sin_smem[half_dim]);
++            float const cos_val = r_cos[i];
++            float const sin_val = r_sin[i];
+             elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
+           }
+-          __syncwarp();
+         }
+       }
+ 
+@@ -545,7 +634,28 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
+               make_float2(elements[2 * i], elements[2 * i + 1]));
+           *(reinterpret_cast<T2_in*>(&vec) + i) = packed_val;
+         }
+-        *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
++        if constexpr (WRITE_CACHE) {
++          T_in* out = reinterpret_cast<T_in*>(isQ ? cw.q_out : cw.k_out);
++          int const out_heads = isQ ? num_heads_q : num_heads_k;
++          int64_t const out_off =
++              (static_cast<int64_t>(tokenIdx) * out_heads + headIdx) *
++                  head_dim +
++              laneId * numElemsPerThread;
++          *reinterpret_cast<vec_T*>(&out[out_off]) = vec;
++          if (!isQ && tokenIdx < cw.num_slot_tokens) {
++            int64_t const slot = cw.slot_mapping[tokenIdx];
++            if (slot >= 0) {
++              T_in* key_cache = reinterpret_cast<T_in*>(cw.key_cache);
++              int64_t const dst = (slot / cw.block_size) * cw.kc_stride_b +
++                                  (slot % cw.block_size) * cw.kc_stride_s +
++                                  headIdx * cw.kc_stride_h +
++                                  laneId * numElemsPerThread;
++              *reinterpret_cast<vec_T*>(&key_cache[dst]) = vec;
++            }
++          }
++        } else {
++          *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
++        }
+       }
+     }
+ 
+@@ -606,17 +716,19 @@ void launchWithPDL(KernelFn kernel, dim3 gridDim, dim3 blockDim,
+ }
+ }  // namespace
+ 
+-template <typename scalar_t_in, typename scalar_t_cache>
++template <typename scalar_t_in, typename scalar_t_cache, bool WRITE_CACHE>
+ void launchFusedQKNormRope(void* qkv, int const num_tokens,
+                            int const num_heads_q, int const num_heads_k,
+                            int const num_heads_v, int const head_dim,
+                            int const rotary_dim, float const eps,
+                            void const* q_weight, void const* k_weight,
+                            void const* cos_sin_cache, bool const interleave,
+-                           int64_t const* position_ids, cudaStream_t stream) {
++                           int64_t const* position_ids, cudaStream_t stream,
++                           KVCacheWriteParams const& cw) {
+   constexpr int blockSize = 256;
+   int const warpsPerBlock = blockSize / 32;
+-  int const totalQKHeads = num_heads_q + num_heads_k;
++  int const totalQKHeads = WRITE_CACHE ? num_heads_q + num_heads_k + num_heads_v
++                                       : num_heads_q + num_heads_k;
+   int const totalWarps = num_tokens * totalQKHeads;
+   int const gridSize = common::divUp(totalWarps, warpsPerBlock);
+   dim3 gridDim(gridSize);
+@@ -625,29 +737,32 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens,
+   switch (head_dim) {
+     case 64:
+       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+-        launchWithPDL(
+-            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 64, INTERLEAVE>,
+-            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+-            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+-            position_ids, num_tokens, rotary_dim);
++        launchWithPDL(fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 64,
++                                            INTERLEAVE, WRITE_CACHE>,
++                      gridDim, blockDim, 0, stream, enable_pdl, qkv,
++                      num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
++                      k_weight, cos_sin_cache, position_ids, num_tokens,
++                      rotary_dim, cw);
+       });
+       break;
+     case 128:
+       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+-        launchWithPDL(
+-            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 128, INTERLEAVE>,
+-            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+-            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+-            position_ids, num_tokens, rotary_dim);
++        launchWithPDL(fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 128,
++                                            INTERLEAVE, WRITE_CACHE>,
++                      gridDim, blockDim, 0, stream, enable_pdl, qkv,
++                      num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
++                      k_weight, cos_sin_cache, position_ids, num_tokens,
++                      rotary_dim, cw);
+       });
+       break;
+     case 256:
+       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+-        launchWithPDL(
+-            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 256, INTERLEAVE>,
+-            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+-            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+-            position_ids, num_tokens, rotary_dim);
++        launchWithPDL(fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 256,
++                                            INTERLEAVE, WRITE_CACHE>,
++                      gridDim, blockDim, 0, stream, enable_pdl, qkv,
++                      num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
++                      k_weight, cos_sin_cache, position_ids, num_tokens,
++                      rotary_dim, cw);
+       });
+       break;
+     default:
+@@ -658,14 +773,14 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens,
+ 
+ // Launch: one warp processes token_heads_per_warp token-heads (1, 2, 4, or 8).
+ // When token_heads_per_warp == 1, delegates to the 1-head baseline above.
+-template <typename scalar_t_in, typename scalar_t_cache>
++template <typename scalar_t_in, typename scalar_t_cache, bool WRITE_CACHE>
+ void launchFusedQKNormRopeNTokenHeads(
+     void* qkv, int const num_tokens, int const num_heads_q,
+     int const num_heads_k, int const num_heads_v, int const head_dim,
+     int const rotary_dim, float const eps, void const* q_weight,
+     void const* k_weight, void const* cos_sin_cache, bool const interleave,
+     int64_t const* position_ids, int const token_heads_per_warp,
+-    cudaStream_t stream) {
++    cudaStream_t stream, KVCacheWriteParams const& cw) {
+   STD_TORCH_CHECK(token_heads_per_warp == 1 || token_heads_per_warp == 2 ||
+                       token_heads_per_warp == 4 || token_heads_per_warp == 8,
+                   "token_heads_per_warp must be 1, 2, 4, or 8, got ",
+@@ -673,14 +788,15 @@ void launchFusedQKNormRopeNTokenHeads(
+ 
+   // token_heads_per_warp == 1: delegate to the 1-head baseline kernel.
+   if (token_heads_per_warp == 1) {
+-    launchFusedQKNormRope<scalar_t_in, scalar_t_cache>(
++    launchFusedQKNormRope<scalar_t_in, scalar_t_cache, WRITE_CACHE>(
+         qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+         rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
+-        position_ids, stream);
++        position_ids, stream, cw);
+     return;
+   }
+ 
+-  // NTokenHeads kernel uses cp.async to load cos/sin in 16-byte chunks.
++  // Preserve B fallback conditions for the initial experiment.
++  // The former cos/sin cp.async path used 16-byte chunks.
+   // If rotary_dim * sizeof(cache_dtype) is not a multiple of 16, the last
+   // cp.async would write past the shared memory allocation.
+   // Fall back to the base kernel instead of failing.
+@@ -689,18 +805,19 @@ void launchFusedQKNormRopeNTokenHeads(
+         static_cast<size_t>(rotary_dim) *
+         (std::is_same_v<scalar_t_cache, float> ? sizeof(float) : 2u);
+     if (rotary_bytes % 16 != 0) {
+-      launchFusedQKNormRope<scalar_t_in, scalar_t_cache>(
++      launchFusedQKNormRope<scalar_t_in, scalar_t_cache, WRITE_CACHE>(
+           qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+           rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
+-          position_ids, stream);
++          position_ids, stream, cw);
+       return;
+     }
+   }
+ 
+   constexpr int blockSize = 256;
+   int const warpsPerBlock = blockSize / 32;
+-  int const totalQKHeads = num_heads_q + num_heads_k;
+-  // Grid: one warp per (token, head_chunk); same token → reuse cos/sin in smem.
++  int const totalQKHeads = WRITE_CACHE ? num_heads_q + num_heads_k + num_heads_v
++                                       : num_heads_q + num_heads_k;
++  // Grid: one warp per (token, head_chunk); same token -> reuse cos/sin in registers.
+   int const head_chunks_per_token =
+       (totalQKHeads + token_heads_per_warp - 1) / token_heads_per_warp;
+   int const total_warps = num_tokens * head_chunks_per_token;
+@@ -708,17 +825,11 @@ void launchFusedQKNormRopeNTokenHeads(
+   dim3 gridDim(gridSize);
+   dim3 blockDim(blockSize);
+   bool const enable_pdl = num_tokens <= kPDLEnableTokens;
+-  // Cache element size: float=4, bfloat16=2 (host-safe; kernel uses same
+-  // layout).
+-  size_t const cache_elem_size =
+-      std::is_same_v<scalar_t_cache, float> ? sizeof(float) : 2u;
+   // QKV smem: token_heads_per_warp tiles per warp, each tile 32*(head_dim/32*2)
+   // = 2*head_dim bytes.
+   size_t const qkv_smem_per_warp = static_cast<size_t>(token_heads_per_warp) *
+                                    2u * static_cast<size_t>(head_dim);
+-  size_t const smem_bytes =
+-      warpsPerBlock * static_cast<size_t>(rotary_dim) * cache_elem_size +
+-      warpsPerBlock * qkv_smem_per_warp;
++  size_t const smem_bytes = warpsPerBlock * qkv_smem_per_warp;
+ 
+ #define LAUNCH_N_TOKEN_HEADS(N)                                               \
+   do {                                                                        \
+@@ -727,30 +838,33 @@ void launchFusedQKNormRopeNTokenHeads(
+         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                         \
+           launchWithPDL(                                                      \
+               fusedQKNormRopeKernelNTokenHeads<scalar_t_in, scalar_t_cache,   \
+-                                               64, INTERLEAVE, (N)>,          \
++                                               64, INTERLEAVE, (N),           \
++                                               WRITE_CACHE>,                  \
+               gridDim, blockDim, smem_bytes, stream, enable_pdl, qkv,         \
+               num_heads_q, num_heads_k, num_heads_v, eps, q_weight, k_weight, \
+-              cos_sin_cache, position_ids, num_tokens, rotary_dim);           \
++              cos_sin_cache, position_ids, num_tokens, rotary_dim, cw);       \
+         });                                                                   \
+         break;                                                                \
+       case 128:                                                               \
+         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                         \
+           launchWithPDL(                                                      \
+               fusedQKNormRopeKernelNTokenHeads<scalar_t_in, scalar_t_cache,   \
+-                                               128, INTERLEAVE, (N)>,         \
++                                               128, INTERLEAVE, (N),          \
++                                               WRITE_CACHE>,                  \
+               gridDim, blockDim, smem_bytes, stream, enable_pdl, qkv,         \
+               num_heads_q, num_heads_k, num_heads_v, eps, q_weight, k_weight, \
+-              cos_sin_cache, position_ids, num_tokens, rotary_dim);           \
++              cos_sin_cache, position_ids, num_tokens, rotary_dim, cw);       \
+         });                                                                   \
+         break;                                                                \
+       case 256:                                                               \
+         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                         \
+           launchWithPDL(                                                      \
+               fusedQKNormRopeKernelNTokenHeads<scalar_t_in, scalar_t_cache,   \
+-                                               256, INTERLEAVE, (N)>,         \
++                                               256, INTERLEAVE, (N),          \
++                                               WRITE_CACHE>,                  \
+               gridDim, blockDim, smem_bytes, stream, enable_pdl, qkv,         \
+               num_heads_q, num_heads_k, num_heads_v, eps, q_weight, k_weight, \
+-              cos_sin_cache, position_ids, num_tokens, rotary_dim);           \
++              cos_sin_cache, position_ids, num_tokens, rotary_dim, cw);       \
+         });                                                                   \
+         break;                                                                \
+       default:                                                                \
+@@ -770,23 +884,14 @@ void launchFusedQKNormRopeNTokenHeads(
+ 
+ }  // namespace tensorrt_llm::kernels
+ 
+-void fused_qk_norm_rope(
+-    torch::stable::Tensor&
+-        qkv,              // Combined QKV tensor [num_tokens,
+-                          // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+-    int64_t num_heads_q,  // Number of query heads
+-    int64_t num_heads_k,  // Number of key heads
+-    int64_t num_heads_v,  // Number of value heads
+-    int64_t head_dim,     // Dimension per head
+-    double eps,           // Epsilon for RMS normalization
+-    torch::stable::Tensor& q_weight,  // RMSNorm weights for query [head_dim]
+-    torch::stable::Tensor& k_weight,  // RMSNorm weights for key [head_dim]
+-    torch::stable::Tensor& cos_sin_cache,  // Cos/sin cache [max_position,
+-                                           // head_dim]
+-    bool is_neox,  // Whether RoPE is applied in Neox style
+-    torch::stable::Tensor& position_ids,  // Position IDs for RoPE [num_tokens]
+-    int64_t forced_token_heads_per_warp   // -1 = auto-select, >0 = forced value
+-) {
++namespace {
++// Argument validation shared by the two entry points below. Returns the
++// token_heads_per_warp to launch with (forced value or auto-selected).
++int validate_qk_norm_rope_args(
++    torch::stable::Tensor& qkv, int64_t num_heads_q, int64_t num_heads_k,
++    int64_t num_heads_v, int64_t head_dim, torch::stable::Tensor& q_weight,
++    torch::stable::Tensor& k_weight, torch::stable::Tensor& cos_sin_cache,
++    torch::stable::Tensor& position_ids, int64_t forced_token_heads_per_warp) {
+   // Input validation
+   CHECK_INPUT(qkv);
+   CHECK_INPUT(position_ids);
+@@ -826,10 +931,6 @@ void fused_qk_norm_rope(
+       qkv.size(1) == total_heads * head_dim,
+       "QKV tensor size must match total number of heads and head dimension");
+ 
+-  const torch::stable::accelerator::DeviceGuard device_guard(
+-      qkv.get_device_index());
+-  auto stream = get_current_cuda_stream(qkv.get_device_index());
+-
+   // Select token_heads_per_warp: forced value if >0, else auto-select.
+   // Auto thresholds are calibrated on SM 9.0 (H100). On other architectures,
+   // fall back to token_heads_per_warp=1 (base kernel) until profiled.
+@@ -860,7 +961,21 @@ void fused_qk_norm_rope(
+       }
+     }
+   }
++  return token_heads_per_warp;
++}
+ 
++template <bool WRITE_CACHE>
++void launch_fused_qk_norm_rope(
++    torch::stable::Tensor& qkv, int64_t num_heads_q, int64_t num_heads_k,
++    int64_t num_heads_v, int64_t head_dim, double eps,
++    torch::stable::Tensor& q_weight, torch::stable::Tensor& k_weight,
++    torch::stable::Tensor& cos_sin_cache, bool is_neox,
++    torch::stable::Tensor& position_ids, int token_heads_per_warp,
++    tensorrt_llm::kernels::KVCacheWriteParams const& cw) {
++  const torch::stable::accelerator::DeviceGuard device_guard(
++      qkv.get_device_index());
++  auto stream = get_current_cuda_stream(qkv.get_device_index());
++  int64_t const num_tokens = qkv.size(0);
+   VLLM_STABLE_DISPATCH_HALF_TYPES(
+       qkv.scalar_type(), "fused_qk_norm_rope_kernel", [&] {
+         using qkv_scalar_t = scalar_t;
+@@ -868,7 +983,7 @@ void fused_qk_norm_rope(
+             cos_sin_cache.scalar_type(), "fused_qk_norm_rope_kernel", [&] {
+               using cache_scalar_t = scalar_t;
+               tensorrt_llm::kernels::launchFusedQKNormRopeNTokenHeads<
+-                  qkv_scalar_t, cache_scalar_t>(
++                  qkv_scalar_t, cache_scalar_t, WRITE_CACHE>(
+                   qkv.data_ptr(), static_cast<int>(num_tokens),
+                   static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),
+                   static_cast<int>(num_heads_v), static_cast<int>(head_dim),
+@@ -876,7 +991,112 @@ void fused_qk_norm_rope(
+                   static_cast<float>(eps), q_weight.data_ptr(),
+                   k_weight.data_ptr(), cos_sin_cache.data_ptr(), !is_neox,
+                   reinterpret_cast<int64_t const*>(position_ids.data_ptr()),
+-                  token_heads_per_warp, stream);
++                  token_heads_per_warp, stream, cw);
+             });
+       });
+ }
++}  // namespace
++
++void fused_qk_norm_rope(
++    torch::stable::Tensor&
++        qkv,              // Combined QKV tensor [num_tokens,
++                          // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
++    int64_t num_heads_q,  // Number of query heads
++    int64_t num_heads_k,  // Number of key heads
++    int64_t num_heads_v,  // Number of value heads
++    int64_t head_dim,     // Dimension per head
++    double eps,           // Epsilon for RMS normalization
++    torch::stable::Tensor& q_weight,  // RMSNorm weights for query [head_dim]
++    torch::stable::Tensor& k_weight,  // RMSNorm weights for key [head_dim]
++    torch::stable::Tensor& cos_sin_cache,  // Cos/sin cache [max_position,
++                                           // head_dim]
++    bool is_neox,  // Whether RoPE is applied in Neox style
++    torch::stable::Tensor& position_ids,  // Position IDs for RoPE [num_tokens]
++    int64_t forced_token_heads_per_warp   // -1 = auto-select, >0 = forced value
++) {
++  int const token_heads_per_warp = validate_qk_norm_rope_args(
++      qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, q_weight, k_weight,
++      cos_sin_cache, position_ids, forced_token_heads_per_warp);
++  tensorrt_llm::kernels::KVCacheWriteParams const cw{};
++  launch_fused_qk_norm_rope<false>(
++      qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight,
++      k_weight, cos_sin_cache, is_neox, position_ids, token_heads_per_warp, cw);
++}
++
++// Same computation as fused_qk_norm_rope, but qkv is read-only: normalised and
++// rotated Q/K are written to q_out [num_tokens, num_heads_q, head_dim] and
++// k_out [num_tokens, num_heads_k, head_dim], and K/V are also scattered into
++// the paged KV cache (flash layout [num_blocks, block_size, num_kv_heads,
++// head_dim]; the block/slot/head strides may be arbitrary, head_dim must be
++// contiguous). This replaces fused_qk_norm_rope + reshape_and_cache_flash
++// with one launch that never re-reads K/V. Only kv_cache_dtype="auto"
++// (cache dtype == qkv dtype) is supported. Tokens at or beyond
++// slot_mapping.size(0), or whose slot is negative, are normalised/rotated
++// but not cached, matching reshape_and_cache_flash.
++void fused_qk_norm_rope_kvcache(
++    torch::stable::Tensor& qkv, torch::stable::Tensor& q_out,
++    torch::stable::Tensor& k_out, int64_t num_heads_q, int64_t num_heads_k,
++    int64_t num_heads_v, int64_t head_dim, double eps,
++    torch::stable::Tensor& q_weight, torch::stable::Tensor& k_weight,
++    torch::stable::Tensor& cos_sin_cache, bool is_neox,
++    torch::stable::Tensor& position_ids, torch::stable::Tensor& key_cache,
++    torch::stable::Tensor& value_cache, torch::stable::Tensor& slot_mapping,
++    int64_t forced_token_heads_per_warp) {
++  int const token_heads_per_warp = validate_qk_norm_rope_args(
++      qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, q_weight, k_weight,
++      cos_sin_cache, position_ids, forced_token_heads_per_warp);
++  int64_t const num_tokens = qkv.size(0);
++  STD_TORCH_CHECK(num_heads_k == num_heads_v,
++                  "fused_qk_norm_rope_kvcache requires num_heads_k == "
++                  "num_heads_v");
++  CHECK_INPUT(q_out);
++  CHECK_INPUT(k_out);
++  CHECK_INPUT(slot_mapping);
++  CHECK_TH_CUDA(key_cache);
++  CHECK_TH_CUDA(value_cache);
++  CHECK_TYPE(slot_mapping, torch::headeronly::ScalarType::Long);
++  STD_TORCH_CHECK(q_out.dim() == 3 && q_out.size(0) == num_tokens &&
++                      q_out.size(1) == num_heads_q && q_out.size(2) == head_dim,
++                  "q_out must be [num_tokens, num_heads_q, head_dim]");
++  STD_TORCH_CHECK(k_out.dim() == 3 && k_out.size(0) == num_tokens &&
++                      k_out.size(1) == num_heads_k && k_out.size(2) == head_dim,
++                  "k_out must be [num_tokens, num_heads_k, head_dim]");
++  STD_TORCH_CHECK(q_out.scalar_type() == qkv.scalar_type() &&
++                      k_out.scalar_type() == qkv.scalar_type(),
++                  "q_out and k_out must have the dtype of qkv");
++  STD_TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
++                  "key/value cache must be [num_blocks, block_size, "
++                  "num_kv_heads, head_dim]");
++  STD_TORCH_CHECK(key_cache.size(1) == value_cache.size(1),
++                  "key/value cache block_size mismatch");
++  STD_TORCH_CHECK(
++      key_cache.size(2) == num_heads_k && key_cache.size(3) == head_dim &&
++          value_cache.size(2) == num_heads_v && value_cache.size(3) == head_dim,
++      "key/value cache head count or head_dim does not match qkv");
++  STD_TORCH_CHECK(key_cache.stride(3) == 1 && value_cache.stride(3) == 1,
++                  "head_dim must be the contiguous dimension of the cache");
++  STD_TORCH_CHECK(key_cache.scalar_type() == qkv.scalar_type() &&
++                      value_cache.scalar_type() == qkv.scalar_type(),
++                  "fused_qk_norm_rope_kvcache only supports "
++                  "kv_cache_dtype=auto (cache dtype == qkv dtype)");
++  STD_TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.size(0) <= num_tokens,
++                  "slot_mapping must be 1D with at most num_tokens entries");
++
++  tensorrt_llm::kernels::KVCacheWriteParams cw;
++  cw.q_out = q_out.data_ptr();
++  cw.k_out = k_out.data_ptr();
++  cw.key_cache = key_cache.data_ptr();
++  cw.value_cache = value_cache.data_ptr();
++  cw.slot_mapping = reinterpret_cast<int64_t const*>(slot_mapping.data_ptr());
++  cw.num_slot_tokens = static_cast<int>(slot_mapping.size(0));
++  cw.block_size = static_cast<int>(key_cache.size(1));
++  cw.kc_stride_b = key_cache.stride(0);
++  cw.kc_stride_s = key_cache.stride(1);
++  cw.kc_stride_h = key_cache.stride(2);
++  cw.vc_stride_b = value_cache.stride(0);
++  cw.vc_stride_s = value_cache.stride(1);
++  cw.vc_stride_h = value_cache.stride(2);
++  launch_fused_qk_norm_rope<true>(
++      qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight,
++      k_weight, cos_sin_cache, is_neox, position_ids, token_heads_per_warp, cw);
++}
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index 6b17815a07..86498f3e68 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -259,6 +259,16 @@ void fused_qk_norm_rope(torch::stable::Tensor& qkv, int64_t num_heads_q,
+                         torch::stable::Tensor& position_ids,
+                         int64_t forced_token_heads_per_warp);
+ 
++void fused_qk_norm_rope_kvcache(
++    torch::stable::Tensor& qkv, torch::stable::Tensor& q_out,
++    torch::stable::Tensor& k_out, int64_t num_heads_q, int64_t num_heads_k,
++    int64_t num_heads_v, int64_t head_dim, double eps,
++    torch::stable::Tensor& q_weight, torch::stable::Tensor& k_weight,
++    torch::stable::Tensor& cos_sin_cache, bool is_neox,
++    torch::stable::Tensor& position_ids, torch::stable::Tensor& key_cache,
++    torch::stable::Tensor& value_cache, torch::stable::Tensor& slot_mapping,
++    int64_t forced_token_heads_per_warp);
++
+ void fused_deepseek_v4_kv_rope_insert(
+     torch::stable::Tensor const& kv, torch::stable::Tensor& k_cache,
+     torch::stable::Tensor const& slot_mapping,
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index a76852df89..0bfb46990d 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -425,6 +425,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "bool is_neox, Tensor position_ids, "
+       "int forced_token_heads_per_warp=-1) -> ()");
+ 
++  // fused_qk_norm_rope with the paged KV-cache write folded in: qkv is
++  // read-only, Q/K land in q_out/k_out and K/V are also scattered into the
++  // flash-layout key/value cache via slot_mapping.
++  ops.def(
++      "fused_qk_norm_rope_kvcache(Tensor qkv, Tensor! q_out, Tensor! k_out, "
++      "int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
++      "float eps, Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
++      "bool is_neox, Tensor position_ids, Tensor! key_cache, "
++      "Tensor! value_cache, Tensor slot_mapping, "
++      "int forced_token_heads_per_warp=-1) -> ()");
++
+   // q_head_padded is the padded Q head count of the returned tensor, or 0 to
+   // do the KV insert alone and return an empty tensor.  The Q knobs are
+   // independent: apply_q_norm and apply_q_rope each drop that step for Q
+@@ -820,6 +831,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+   // Positional encoding kernels (shared CUDA/ROCm)
+   ops.impl("rotary_embedding", TORCH_BOX(&rotary_embedding));
+   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
++  ops.impl("fused_qk_norm_rope_kvcache",
++           TORCH_BOX(&fused_qk_norm_rope_kvcache));
+   ops.impl("fused_deepseek_v4_kv_rope_insert",
+            TORCH_BOX(&fused_deepseek_v4_kv_rope_insert));
+   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+diff --git a/tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py b/tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py
+new file mode 100644
+index 0000000000..38122b3642
+--- /dev/null
++++ b/tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py
+@@ -0,0 +1,297 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CUDA counterpart of test_rocm_aiter_qk_norm_rope_kvcache_fusion: the
++QK-norm + RoPE + unified_kv_cache_update sequence is fused into one
++fused_qk_norm_rope_kvcache launch on the FlashAttention backend."""
++
++import os
++
++import pytest
++import torch
++
++import vllm.config
++from tests.compile.backend import TestBackend
++from tests.v1.attention.utils import (
++    BatchSpec,
++    create_common_attn_metadata,
++    dense_kv_cache_views,
++)
++from vllm.compilation.passes.fusion.matcher_utils import ROTARY_OP
++from vllm.compilation.passes.fusion.qk_norm_rope_kvcache_fusion import (
++    QkNormRopeKvCacheFusionPass,
++)
++from vllm.compilation.passes.utility.noop_elimination import NoOpEliminationPass
++from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
++from vllm.compilation.passes.utility.scatter_split_replace import (
++    ScatterSplitReplacementPass,
++)
++from vllm.compilation.passes.utility.split_coalescing import SplitCoalescingPass
++from vllm.config import (
++    CacheConfig,
++    CompilationConfig,
++    CompilationMode,
++    ModelConfig,
++    PassConfig,
++    VllmConfig,
++)
++from vllm.forward_context import get_forward_context, set_forward_context
++from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import _encode_layer_name
++from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
++from vllm.v1.attention.backends.registry import AttentionBackendEnum
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++if not current_platform.is_cuda():
++    pytest.skip("fused_qk_norm_rope_kvcache is CUDA-only", allow_module_level=True)
++
++INDEX_SELECT_OP = torch.ops.aten.index.Tensor
++
++
++@pytest.fixture(scope="module", autouse=True)
++def module_global_cleanup():
++    from vllm.distributed import cleanup_dist_env_and_memory
++
++    yield
++    cleanup_dist_env_and_memory()
++
++
++class QKNormRoPEKVCacheTestModel(torch.nn.Module):
++    """q, k, v = split(qkv); q/k = rms_norm(...); q, k = rope(...);
++    dummy = unified_kv_cache_update(k, v, layer_name)"""
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        attn_backend: AttentionBackendEnum,
++        num_heads: int,
++        num_kv_heads: int,
++        head_size: int,
++        rotary_dim: int,
++        is_neox: bool,
++        rms_norm_eps: float,
++        dtype: torch.dtype,
++        device: torch.device,
++        prefix: str = "model.layers.0.self_attn.attn",
++    ):
++        super().__init__()
++        self.num_heads = num_heads
++        self.num_kv_heads = num_kv_heads
++        self.head_size = head_size
++        self.block_size = vllm_config.cache_config.block_size
++        self.q_size = num_heads * head_size
++        self.kv_size = num_kv_heads * head_size
++        self.dtype = dtype
++        self.device = device
++        self.layer_name = prefix
++        self.q_norm = RMSNorm(head_size, eps=rms_norm_eps)
++        self.k_norm = RMSNorm(head_size, eps=rms_norm_eps)
++        self.rotary_emb = RotaryEmbedding(
++            head_size,
++            rotary_dim=rotary_dim,
++            max_position_embeddings=4096,
++            base=10000,
++            is_neox_style=is_neox,
++            dtype=dtype,
++        )
++        self.enable_rope_custom_op = self.rotary_emb.enabled()
++        self.attn = Attention(
++            num_heads=num_heads,
++            head_size=head_size,
++            scale=1.0 / head_size**0.5,
++            num_kv_heads=num_kv_heads,
++            cache_config=vllm_config.cache_config,
++            quant_config=vllm_config.quant_config,
++            prefix=prefix,
++            attn_backend=attn_backend.get_class(),
++        )
++        self.attn_backend: type[AttentionBackend] = self.attn.get_attn_backend()
++        assert not self.attn_backend.forward_includes_kv_cache_update
++        assert self.attn.impl.fused_qk_norm_rope_kvcache_supported()
++        self.attn._k_scale = self.attn._k_scale.to(device)
++        self.attn._v_scale = self.attn._v_scale.to(device)
++        self.kv_cache_spec = self.attn.attn_backend.customize_spec(
++            AttentionSpec(
++                block_size=self.block_size,
++                num_kv_heads=num_kv_heads,
++                head_size=head_size,
++                dtype=dtype,
++            )
++        )
++        self.builder = self.attn.attn_backend.get_builder_cls()(
++            kv_cache_spec=self.kv_cache_spec,
++            layer_names=[self.attn.layer_name],
++            vllm_config=vllm_config,
++            device=device,
++        )
++
++    def build_attn_metadata(
++        self, batch_size: int, layout: KVCacheLayout
++    ) -> CommonAttentionMetadata:
++        batch_spec = BatchSpec(seq_lens=[1] * batch_size, query_lens=[1] * batch_size)
++        common_attn_metadata = create_common_attn_metadata(
++            batch_spec, self.block_size, self.device, arange_block_indices=True
++        )
++        num_blocks = batch_size * (
++            (max(batch_spec.seq_lens) + self.block_size - 1) // self.block_size
++        )
++        raw_tensor = torch.zeros(
++            num_blocks * self.kv_cache_spec.page_size_bytes,
++            dtype=torch.int8,
++            device=self.device,
++        )
++        self.attn.kv_cache = dense_kv_cache_views(
++            raw_tensor, self.kv_cache_spec, num_blocks, num_layers=1, layout=layout
++        )[0]
++        return self.builder.build(
++            common_prefix_len=0, common_attn_metadata=common_attn_metadata
++        )
++
++    def forward(
++        self, qkv: torch.Tensor, positions: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        qkv = qkv.clone()
++        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q = self.q_norm(q.view(-1, self.num_heads, self.head_size)).view(
++            -1, self.q_size
++        )
++        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_size)).view(
++            -1, self.kv_size
++        )
++        q, k = self.rotary_emb(positions, q, k)
++        q = q.view(-1, self.num_heads, self.head_size)
++        k = k.view(-1, self.num_kv_heads, self.head_size)
++        v = v.view(-1, self.num_kv_heads, self.head_size)
++        kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
++            k, v, _encode_layer_name(self.layer_name)
++        )
++        return q, k, v, kv_cache_dummy_dep
++
++    def ops_in_model_before(self) -> list[torch._ops.OpOverload]:
++        rope_op = ROTARY_OP if self.enable_rope_custom_op else INDEX_SELECT_OP
++        return [rope_op, torch.ops.vllm.unified_kv_cache_update.default]
++
++    def ops_in_model_after(self) -> list[torch._ops.OpOverload]:
++        return [torch.ops.vllm.fused_qk_norm_rope_and_unified_kv_cache_update.default]
++
++
++_FUSION_CONFIGS = [
++    pytest.param(32, 8, 128, 128, True, id="qwen3-neox"),
++    pytest.param(32, 8, 128, 128, False, id="gptj"),
++    pytest.param(16, 2, 64, 64, True, id="hd64"),
++    pytest.param(8, 2, 256, 256, True, id="hd256"),
++    pytest.param(32, 8, 128, 64, True, id="partial-rotary"),
++]
++
++
++@pytest.mark.parametrize(
++    "num_heads, num_kv_heads, head_size, rotary_dim, is_neox", _FUSION_CONFIGS
++)
++@pytest.mark.parametrize("num_tokens", [5, 2048])
++@pytest.mark.parametrize(
++    "kv_layout",
++    [
++        pytest.param(KVCacheLayout.LBHNC, id="head_major"),
++        pytest.param(KVCacheLayout.LBNHC, id="token_major"),
++    ],
++)
++@pytest.mark.parametrize("block_size", [16, 64])
++@pytest.mark.parametrize("dtype", [torch.bfloat16])
++@pytest.mark.parametrize("custom_op", ["+rotary_embedding", "+rms_norm"])
++def test_qk_norm_rope_kvcache_fusion(
++    num_heads: int,
++    num_kv_heads: int,
++    head_size: int,
++    rotary_dim: int,
++    is_neox: bool,
++    num_tokens: int,
++    kv_layout: KVCacheLayout,
++    block_size: int,
++    dtype: torch.dtype,
++    custom_op: str,
++):
++    device = os.environ.get("VLLM_TEST_CUDA_DEVICE", "cuda")
++    torch.set_default_device(device)
++    torch.set_default_dtype(dtype)
++    torch.manual_seed(0)
++    rms_norm_eps = 1e-6
++
++    vllm_config = VllmConfig(
++        model_config=ModelConfig(dtype=dtype),
++        cache_config=CacheConfig(block_size=block_size, cache_dtype="auto"),
++        compilation_config=CompilationConfig(
++            mode=CompilationMode.VLLM_COMPILE,
++            custom_ops=[custom_op],
++            pass_config=PassConfig(
++                fuse_qk_norm_rope_kvcache=True,
++                eliminate_noops=True,
++            ),
++        ),
++    )
++    with vllm.config.set_current_vllm_config(vllm_config):
++        model = QKNormRoPEKVCacheTestModel(
++            vllm_config=vllm_config,
++            attn_backend=AttentionBackendEnum.FLASH_ATTN,
++            num_heads=num_heads,
++            num_kv_heads=num_kv_heads,
++            head_size=head_size,
++            rotary_dim=rotary_dim,
++            is_neox=is_neox,
++            rms_norm_eps=rms_norm_eps,
++            dtype=dtype,
++            device=torch.get_default_device(),
++        )
++        fusion_pass = QkNormRopeKvCacheFusionPass(vllm_config)
++        backend = TestBackend(
++            NoOpEliminationPass(vllm_config),
++            SplitCoalescingPass(vllm_config),
++            ScatterSplitReplacementPass(vllm_config),
++            fusion_pass,
++            PostCleanupPass(vllm_config),
++        )
++        qkv = torch.randn(num_tokens, (num_heads + 2 * num_kv_heads) * head_size)
++        pos = torch.arange(num_tokens, dtype=torch.long)
++
++        with set_forward_context(None, vllm_config):
++            forward_context = get_forward_context()
++            attn_metadata = model.build_attn_metadata(num_tokens, kv_layout)
++            forward_context.slot_mapping = {
++                model.layer_name: attn_metadata.slot_mapping
++            }
++            q_unfused, k_unfused, v_unfused, _ = model(qkv.clone(), pos.clone())
++            kv_cache_unfused = forward_context.no_compile_layers[
++                model.layer_name
++            ].kv_cache.clone()
++
++        torch._dynamo.mark_dynamic(qkv, 0)
++        torch._dynamo.mark_dynamic(pos, 0)
++        with set_forward_context(None, vllm_config):
++            model_fused = torch.compile(model, backend=backend)
++            forward_context = get_forward_context()
++            attn_metadata = model_fused.build_attn_metadata(num_tokens, kv_layout)
++            forward_context.slot_mapping = {
++                model.layer_name: attn_metadata.slot_mapping
++            }
++            q_fused, k_fused, v_fused, _ = model_fused(qkv, pos)
++            kv_cache_fused = forward_context.no_compile_layers[
++                model.layer_name
++            ].kv_cache
++
++        assert fusion_pass.matched_count == 1
++        backend.check_before_ops(model.ops_in_model_before())
++        backend.check_after_ops(model.ops_in_model_after())
++
++        # The fused kernel keeps the rotated values in fp32 between the norm
++        # and the rotation, so it is not bit-identical to the two-step
++        # reference; the tolerance matches test_fused_qk_norm_rope.
++        atol = rtol = 1e-2
++        torch.testing.assert_close(q_unfused, q_fused, atol=atol, rtol=rtol)
++        torch.testing.assert_close(k_unfused, k_fused, atol=atol, rtol=rtol)
++        torch.testing.assert_close(v_unfused, v_fused, atol=0.0, rtol=0.0)
++        torch.testing.assert_close(
++            kv_cache_unfused.float(), kv_cache_fused.float(), atol=atol, rtol=rtol
++        )
+diff --git a/tests/kernels/core/test_fused_qk_norm_rope_kvcache.py b/tests/kernels/core/test_fused_qk_norm_rope_kvcache.py
+new file mode 100644
+index 0000000000..c34fb695ae
+--- /dev/null
++++ b/tests/kernels/core/test_fused_qk_norm_rope_kvcache.py
+@@ -0,0 +1,283 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""fused_qk_norm_rope_kvcache must reproduce fused_qk_norm_rope followed by
++reshape_and_cache_flash bit for bit: same Q/K values (now in q_out/k_out
++instead of qkv), same K/V rows in the paged cache, qkv left untouched."""
++
++import pytest
++import torch
++
++from tests.kernels.utils import opcheck
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import set_random_seed
++
++BLOCK_SIZE = 16
++MAX_POSITION = 4096
++
++
++def _make_inputs(
++    num_tokens: int,
++    num_heads: int,
++    num_kv_heads: int,
++    head_dim: int,
++    rotary_dim: int,
++    is_neox: bool,
++    dtype: torch.dtype,
++    device: str,
++):
++    total_dim = (num_heads + 2 * num_kv_heads) * head_dim
++    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
++    positions = torch.randint(0, MAX_POSITION, (num_tokens,), device=device)
++    q_weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.1 + 1.0
++    k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.1 + 1.0
++    rope = RotaryEmbedding(
++        head_size=head_dim,
++        rotary_dim=rotary_dim,
++        max_position_embeddings=MAX_POSITION,
++        base=10000.0,
++        is_neox_style=is_neox,
++        dtype=dtype,
++    ).to(device)
++    return qkv, positions, q_weight, k_weight, rope.cos_sin_cache
++
++
++def _make_flash_kv_cache(
++    num_tokens: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, device
++):
++    """One (num_blocks, H, N, 2*D) buffer split into strided key/value views,
++    exactly as the FlashAttention backend hands them to the cache-write op."""
++    num_blocks = (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 2
++    kv = torch.randn(
++        num_blocks, num_kv_heads, BLOCK_SIZE, 2 * head_dim, dtype=dtype, device=device
++    )
++    return kv
++
++
++def _split_kv(kv: torch.Tensor, head_dim: int):
++    return kv.transpose(1, 2).split(head_dim, dim=-1)
++
++
++def _make_slot_mapping(num_tokens: int, num_slots: int, num_padded: int, device):
++    slots = torch.randperm(num_slots, device=device)[:num_tokens].to(torch.int64)
++    if num_padded:
++        slots[num_tokens - num_padded :] = -1
++    return slots
++
++
++def _reference(
++    qkv, positions, q_weight, k_weight, cos_sin_cache, is_neox, kv, geometry, slots
++):
++    num_heads, num_kv_heads, head_dim, eps = geometry
++    qkv_ref = qkv.clone()
++    ops.fused_qk_norm_rope(
++        qkv_ref,
++        num_heads,
++        num_kv_heads,
++        num_kv_heads,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        is_neox,
++        positions,
++    )
++    q_size = num_heads * head_dim
++    kv_size = num_kv_heads * head_dim
++    q_ref = qkv_ref[:, :q_size].view(-1, num_heads, head_dim)
++    k_ref = qkv_ref[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim)
++    v_ref = qkv_ref[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim)
++    kv_ref = kv.clone()
++    key_cache, value_cache = _split_kv(kv_ref, head_dim)
++    one = torch.tensor(1.0, dtype=torch.float32, device=qkv.device)
++    ops.reshape_and_cache_flash(
++        k_ref[: slots.shape[0]],
++        v_ref[: slots.shape[0]],
++        key_cache,
++        value_cache,
++        slots,
++        "auto",
++        one,
++        one,
++    )
++    return q_ref, k_ref, kv_ref
++
++
++def _run_and_check(
++    qkv,
++    positions,
++    q_weight,
++    k_weight,
++    cos_sin_cache,
++    is_neox,
++    kv,
++    geometry,
++    slots,
++    token_heads_per_warp=-1,
++    check_op=False,
++):
++    num_heads, num_kv_heads, head_dim, eps = geometry
++    q_ref, k_ref, kv_ref = _reference(
++        qkv, positions, q_weight, k_weight, cos_sin_cache, is_neox, kv, geometry, slots
++    )
++    qkv_in = qkv.clone()
++    q_out = torch.empty_like(q_ref)
++    k_out = torch.empty_like(k_ref)
++    kv_out = kv.clone()
++    key_cache, value_cache = _split_kv(kv_out, head_dim)
++    args = (
++        qkv_in,
++        q_out,
++        k_out,
++        num_heads,
++        num_kv_heads,
++        num_kv_heads,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        is_neox,
++        positions,
++        key_cache,
++        value_cache,
++        slots,
++        token_heads_per_warp,
++    )
++    if check_op:
++        opcheck(torch.ops._C.fused_qk_norm_rope_kvcache, args)
++    ops.fused_qk_norm_rope_kvcache(*args)
++    assert torch.equal(qkv_in, qkv), "qkv must be read-only"
++    assert torch.equal(q_out, q_ref)
++    assert torch.equal(k_out, k_ref)
++    assert torch.equal(kv_out, kv_ref)
++
++
++@pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="fused_qk_norm_rope_kvcache is CUDA-only"
++)
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("is_neox", [True, False])
++@pytest.mark.parametrize(
++    "num_heads, num_kv_heads, head_dim, rotary_dim",
++    [
++        (32, 8, 128, 128),
++        (16, 4, 64, 64),
++        (8, 2, 256, 256),
++        (8, 8, 128, 128),
++        (32, 8, 128, 64),
++    ],
++)
++@pytest.mark.parametrize("num_tokens", [1, 5, 300, 2048])
++@pytest.mark.parametrize("eps", [1e-6])
++@torch.inference_mode()
++def test_matches_unfused_pair(
++    default_vllm_config,
++    dtype,
++    is_neox,
++    num_heads,
++    num_kv_heads,
++    head_dim,
++    rotary_dim,
++    num_tokens,
++    eps,
++):
++    device = "cuda:0"
++    set_random_seed(13)
++    qkv, positions, q_weight, k_weight, cos_sin_cache = _make_inputs(
++        num_tokens,
++        num_heads,
++        num_kv_heads,
++        head_dim,
++        rotary_dim,
++        is_neox,
++        dtype,
++        device,
++    )
++    kv = _make_flash_kv_cache(num_tokens, num_kv_heads, head_dim, dtype, device)
++    slots = _make_slot_mapping(num_tokens, kv.shape[0] * BLOCK_SIZE, 0, device)
++    _run_and_check(
++        qkv,
++        positions,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        is_neox,
++        kv,
++        (num_heads, num_kv_heads, head_dim, eps),
++        slots,
++        check_op=num_tokens == 5,
++    )
++
++
++@pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="fused_qk_norm_rope_kvcache is CUDA-only"
++)
++@pytest.mark.parametrize("token_heads_per_warp", [1, 2, 4, 8])
++@pytest.mark.parametrize("num_tokens", [5, 2048])
++@pytest.mark.parametrize("is_neox", [True, False])
++@torch.inference_mode()
++def test_all_token_heads_per_warp(
++    default_vllm_config, token_heads_per_warp, num_tokens, is_neox
++):
++    device, dtype = "cuda:0", torch.bfloat16
++    set_random_seed(13)
++    num_heads, num_kv_heads, head_dim = 32, 8, 128
++    qkv, positions, q_weight, k_weight, cos_sin_cache = _make_inputs(
++        num_tokens, num_heads, num_kv_heads, head_dim, head_dim, is_neox, dtype, device
++    )
++    kv = _make_flash_kv_cache(num_tokens, num_kv_heads, head_dim, dtype, device)
++    slots = _make_slot_mapping(num_tokens, kv.shape[0] * BLOCK_SIZE, 0, device)
++    _run_and_check(
++        qkv,
++        positions,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        is_neox,
++        kv,
++        (num_heads, num_kv_heads, head_dim, 1e-6),
++        slots,
++        token_heads_per_warp=token_heads_per_warp,
++    )
++
++
++@pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="fused_qk_norm_rope_kvcache is CUDA-only"
++)
++@pytest.mark.parametrize(
++    "num_tokens, num_slot_tokens, num_padded",
++    [
++        (64, 64, 7),  # CUDA-graph padding: trailing slots are -1
++        (64, 40, 0),  # slot_mapping shorter than qkv (num_actual_tokens < padded)
++        (300, 290, 5),
++    ],
++)
++@torch.inference_mode()
++def test_padded_and_short_slot_mapping(
++    default_vllm_config, num_tokens, num_slot_tokens, num_padded
++):
++    """Rows without a slot are still normalised/rotated but never cached."""
++    device, dtype = "cuda:0", torch.bfloat16
++    set_random_seed(13)
++    num_heads, num_kv_heads, head_dim = 16, 4, 128
++    qkv, positions, q_weight, k_weight, cos_sin_cache = _make_inputs(
++        num_tokens, num_heads, num_kv_heads, head_dim, head_dim, True, dtype, device
++    )
++    kv = _make_flash_kv_cache(num_tokens, num_kv_heads, head_dim, dtype, device)
++    slots = _make_slot_mapping(
++        num_slot_tokens, kv.shape[0] * BLOCK_SIZE, num_padded, device
++    )
++    _run_and_check(
++        qkv,
++        positions,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        True,
++        kv,
++        (num_heads, num_kv_heads, head_dim, 1e-6),
++        slots,
++    )
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 4951014d1b..0d15fd10c6 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -477,6 +477,211 @@ def test_schedule_prefills_gating(has_running: bool):
+     assert any(r.req_id == "new0" for r in output.scheduled_new_reqs)
+ 
+ 
++def _setup_cache_aware(num_tokens: int = 48, **kwargs):
++    """A scheduler where `warm`'s prompt is already cached and `cold`'s is not.
++
++    Returns `(scheduler, warm, cold)`, with neither request added yet.
++
++    The threshold is pinned rather than inherited. These fixtures sit at ~0 KV
++    cache usage, so under the shipped default of 0.5 the reorder would never
++    run and every test below would pass without exercising it. Tests that are
++    about the threshold itself pass their own value.
++    """
++    kwargs.setdefault("cache_aware_admission_threshold", 0)
++    scheduler = create_scheduler(enable_prefix_caching=True, **kwargs)
++    seed, warm = create_requests(
++        num_requests=2,
++        num_tokens=num_tokens,
++        same_prompt=True,
++        req_ids=["seed", "warm"],
++    )
++    # Only index 0 of a `same_prompt` batch collides with a distinct-prompt
++    # batch, so index 1 here is a prompt no other request shares.
++    cold = create_requests(
++        num_requests=2, num_tokens=num_tokens, req_ids=["unused", "cold"]
++    )[1]
++
++    # Run `seed` far enough to leave its prompt in the prefix cache.
++    scheduler.add_request(seed)
++    output = scheduler.schedule()
++    assert "seed" in output.num_scheduled_tokens
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=["seed"],
++            req_id_to_index={"seed": 0},
++            sampled_token_ids=[[0]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    scheduler.finish_requests("seed", RequestStatus.FINISHED_ABORTED)
++
++    assert scheduler.kv_cache_manager.get_num_cached_tokens(warm) > 0
++    assert scheduler.kv_cache_manager.get_num_cached_tokens(cold) == 0
++    return scheduler, warm, cold
++
++
++def test_cache_aware_admission_prefers_cached_prefix():
++    """Within the window, a request whose prefix is already cached is admitted
++    ahead of one that would have to compute its own, so the cold request cannot
++    evict blocks the resident one still needs.
++    """
++    scheduler, warm, cold = _setup_cache_aware(cache_aware_admission_window=4)
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++
++    output = scheduler.schedule()
++    assert [r.req_id for r in output.scheduled_new_reqs] == ["warm", "cold"]
++
++
++@pytest.mark.parametrize("window", [0, 4])
++def test_cache_aware_admission_protects_resident_prefix_from_eviction(window: int):
++    """The point of the reordering, not just its ordering.
++
++    With the cache too small to hold both prompts, whichever request is
++    admitted first keeps its blocks. Arrival order puts the cold request first,
++    so only the reordering can stop it evicting the prefix the warm request
++    still needs. `window=0` is the control: same setup, reordering off.
++    """
++    # 48-token prompts at block_size 16 are 3 blocks each; 5 blocks cannot hold
++    # both, so admitting one evicts the other's cached prefix.
++    scheduler, warm, cold = _setup_cache_aware(
++        num_tokens=48,
++        num_blocks=5,
++        block_size=16,
++        cache_aware_admission_window=window,
++    )
++    cached_before = scheduler.kv_cache_manager.get_num_cached_tokens(warm)
++    assert cached_before > 0
++
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++    output = scheduler.schedule()
++    scheduled = [r.req_id for r in output.scheduled_new_reqs]
++
++    if window:
++        # The warm request goes first and is admitted against its cached
++        # prefix, so it computes fewer tokens than its prompt.
++        assert scheduled[0] == "warm"
++        assert output.num_scheduled_tokens["warm"] < warm.num_prompt_tokens
++    else:
++        # Arrival order wins: the cold request takes the blocks it needs and
++        # the warm request's resident prefix is partly evicted, so the hit it
++        # would have had shrinks and those tokens must be recomputed.
++        assert scheduled[0] == "cold"
++        assert scheduler.kv_cache_manager.get_num_cached_tokens(warm) < cached_before
++
++
++def test_cache_aware_admission_keeps_blocked_and_started_requests_in_place():
++    """Reordering is confined to plain waiting peers.
++
++    A request in a blocked status, and one that is already partially computed,
++    each keep their exact index; nothing is moved across them, and the queue
++    beyond the window is untouched. This is the property that makes this a
++    reorder among peers rather than a priority change.
++    """
++    scheduler, warm, cold = _setup_cache_aware(cache_aware_admission_window=4)
++
++    blocked, started, tail = create_requests(
++        num_requests=3, num_tokens=48, req_ids=["blocked", "started", "tail"]
++    )
++    # Enqueue everything as a plain waiting request first: a request that is
++    # already blocked on arrival is routed to `skipped_waiting` instead, and
++    # the guard under test is for one whose state changed while queued.
++    for request in (cold, blocked, started, warm, tail):
++        scheduler.add_request(request)
++    blocked.status = RequestStatus.WAITING_FOR_REMOTE_KVS
++    started.num_computed_tokens = 16
++
++    before = [r.request_id for r in scheduler.waiting]
++    assert before == ["cold", "blocked", "started", "warm", "tail"]
++
++    scheduler._reorder_waiting_by_cached_prefix()
++    after = [r.request_id for r in scheduler.waiting]
++
++    # Only `cold` and `warm` are plain waiting peers inside the 4-slot window,
++    # so only they swap. `blocked` holds index 1, `started` holds index 2, and
++    # `tail` sits beyond the window untouched.
++    assert after == ["warm", "blocked", "started", "cold", "tail"]
++
++
++def test_cache_aware_admission_does_not_look_past_the_window():
++    """The window bounds how far a cached request can be promoted from, so a
++    request outside it keeps its place in arrival order.
++    """
++    scheduler, warm, cold = _setup_cache_aware(cache_aware_admission_window=1)
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++
++    output = scheduler.schedule()
++    assert [r.req_id for r in output.scheduled_new_reqs] == ["cold", "warm"]
++
++
++def test_cache_aware_admission_skipped_below_threshold():
++    """Below the usage threshold there are no evictions worth avoiding, so
++    admission stays in arrival order.
++    """
++    scheduler, warm, cold = _setup_cache_aware(
++        cache_aware_admission_window=4, cache_aware_admission_threshold=0.9
++    )
++    assert scheduler.kv_cache_manager.usage < 0.9
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++
++    output = scheduler.schedule()
++    assert [r.req_id for r in output.scheduled_new_reqs] == ["cold", "warm"]
++
++
++def test_cache_aware_admission_is_safe_on_a_mamba_spec():
++    """The probe must not assume full attention.
++
++    `get_num_cached_tokens` goes through the KV cache coordinator, so a group
++    whose spec is not full attention has to be handled rather than crash. A
++    Mamba group keeps recurrent state rather than a reusable token prefix, so
++    the probe finds nothing to reuse and the reordering degrades to a no-op
++    instead of shuffling the queue on meaningless scores.
++    """
++    scheduler = create_scheduler(
++        enable_prefix_caching=True,
++        cache_aware_admission_window=4,
++        cache_aware_admission_threshold=0.0,
++        kv_cache_spec=MambaSpec(
++            block_size=16,
++            shapes=((1, 1),),
++            dtypes=(torch.float32,),
++            mamba_cache_mode="align",
++        ),
++    )
++    assert scheduler.cache_aware_window == 4
++
++    requests = create_requests(num_requests=3, num_tokens=48, req_ids=["a", "b", "c"])
++    for request in requests:
++        scheduler.add_request(request)
++
++    # Probing is safe, reports no reusable prefix, and leaves arrival order.
++    assert all(
++        scheduler.kv_cache_manager.get_num_cached_tokens(r) == 0 for r in requests
++    )
++    scheduler._reorder_waiting_by_cached_prefix()
++    assert [r.request_id for r in scheduler.waiting] == ["a", "b", "c"]
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        # Reordering by queue position is meaningless in a priority heap.
++        {"scheduling_policy": "priority", "enable_prefix_caching": True},
++        # Nothing to reorder by without a prefix cache.
++        {"enable_prefix_caching": False},
++    ],
++)
++def test_cache_aware_admission_requires_fcfs_and_prefix_caching(kwargs: dict):
++    scheduler = create_scheduler(cache_aware_admission_window=4, **kwargs)
++    assert scheduler.cache_aware_window == 0
++
++
+ def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
+     """Drive a remote-KV request `r2` to the resume point (async load complete)
+     while another request `r1` is already decoding, so the step is throttle-
+@@ -6794,3 +6999,64 @@ def test_update_draft_token_ids_in_output_strips_padding():
+         -1,
+     ]
+     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
++
++
++def test_cache_aware_admission_skips_full_active_slots_and_resumes(mocker):
++    scheduler, warm, cold = _setup_cache_aware(
++        cache_aware_admission_window=4,
++        max_num_seqs=16,
++        max_num_active_seqs=1,
++    )
++    blocker = create_requests(
++        num_requests=3, num_tokens=48, req_ids=["unused0", "unused1", "blocker"]
++    )[2]
++    scheduler.add_request(blocker)
++    output = scheduler.schedule()
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=["blocker"], req_id_to_index={"blocker": 0},
++            sampled_token_ids=[[0]], logprobs=None,
++            prompt_logprobs_dict={}, pooler_output=[],
++        ),
++    )
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++    probe = mocker.spy(scheduler.kv_cache_manager, "get_num_cached_tokens")
++    output = scheduler.schedule()
++    assert "blocker" in output.num_scheduled_tokens
++    assert not output.scheduled_new_reqs
++    assert probe.call_count == 0
++    assert [r.request_id for r in scheduler.waiting] == ["cold", "warm"]
++
++    # A new equal-hit request arrives while admission is blocked.
++    later = create_requests(
++        num_requests=1, num_tokens=48, same_prompt=True, req_ids=["warm_later"]
++    )[0]
++    scheduler.add_request(later)
++    scheduler.finish_requests("blocker", RequestStatus.FINISHED_ABORTED)
++    probe.reset_mock()
++    output = scheduler.schedule()
++    assert probe.call_count == 3
++    assert [r.req_id for r in output.scheduled_new_reqs] == ["warm"]
++    assert [r.request_id for r in scheduler.waiting] == ["warm_later", "cold"]
++
++
++def test_cache_aware_admission_counts_streaming_slots(mocker):
++    scheduler, warm, cold = _setup_cache_aware(
++        cache_aware_admission_window=4, max_num_seqs=16, max_num_active_seqs=1,
++    )
++    scheduler.add_request(cold)
++    scheduler.add_request(warm)
++    # Model a slot held by a paused streaming session outside `running`.
++    scheduler.num_waiting_for_streaming_input = 1
++    probe = mocker.spy(scheduler.kv_cache_manager, "get_num_cached_tokens")
++    output = scheduler.schedule()
++    assert not output.scheduled_new_reqs
++    assert probe.call_count == 0
++    assert [r.request_id for r in scheduler.waiting] == ["cold", "warm"]
++
++    scheduler.num_waiting_for_streaming_input = 0
++    output = scheduler.schedule()
++    assert probe.call_count == 2
++    assert [r.req_id for r in output.scheduled_new_reqs] == ["warm"]
+diff --git a/tests/v1/core/utils.py b/tests/v1/core/utils.py
+index f69b10ced3..d7bd316120 100644
+--- a/tests/v1/core/utils.py
++++ b/tests/v1/core/utils.py
+@@ -76,6 +76,8 @@ def create_scheduler(
+     use_v2_model_runner: bool | None = None,
+     kv_cache_spec: KVCacheSpec | None = None,
+     per_request_spec_decode_metrics: str = "none",
++    cache_aware_admission_window: int = 0,
++    cache_aware_admission_threshold: float = 0.5,
+     scheduling_policy: SchedulerPolicy = "fcfs",
+ ) -> Scheduler | AsyncScheduler:
+     """Create scheduler under test.
+@@ -116,6 +118,8 @@ def create_scheduler(
+         enable_chunked_prefill=enable_chunked_prefill,
+         async_scheduling=async_scheduling,
+         is_encoder_decoder=model_config.is_encoder_decoder,
++        cache_aware_admission_window=cache_aware_admission_window,
++        cache_aware_admission_threshold=cache_aware_admission_threshold,
+         # Ensure admission/preemption mechanics are deterministic
+         watermark=0.0,
+         policy=scheduling_policy,
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 2a1654231f..bc7567fff2 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -367,6 +367,54 @@ def fused_qk_norm_rope(
+     )
+ 
+ 
++def fused_qk_norm_rope_kvcache(
++    qkv: torch.Tensor,
++    q_out: torch.Tensor,
++    k_out: torch.Tensor,
++    num_heads_q: int,
++    num_heads_k: int,
++    num_heads_v: int,
++    head_dim: int,
++    eps: float,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    is_neox: bool,
++    position_ids: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    forced_token_heads_per_warp: int = -1,
++) -> None:
++    """fused_qk_norm_rope with the flash-layout KV-cache write folded in.
++
++    qkv is read-only; the normalised/rotated Q and K are written to q_out
++    [num_tokens, num_heads_q, head_dim] and k_out [num_tokens, num_heads_k,
++    head_dim], and K/V are scattered into key_cache/value_cache
++    ([num_blocks, block_size, num_kv_heads, head_dim], head_dim contiguous)
++    at slot_mapping. Only kv_cache_dtype="auto" is supported.
++    """
++    torch.ops._C.fused_qk_norm_rope_kvcache(
++        qkv,
++        q_out,
++        k_out,
++        num_heads_q,
++        num_heads_k,
++        num_heads_v,
++        head_dim,
++        eps,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        is_neox,
++        position_ids,
++        key_cache,
++        value_cache,
++        slot_mapping,
++        forced_token_heads_per_warp,
++    )
++
++
+ def apply_repetition_penalties_torch(
+     logits: torch.Tensor,
+     prompt_mask: torch.Tensor,
+diff --git a/vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py b/vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py
+index 80eeb648f4..797e4a6b1b 100644
+--- a/vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py
++++ b/vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py
+@@ -20,7 +20,13 @@ from vllm.model_executor.layers.attention.attention import (
+     get_attention_context,
+ )
+ from vllm.platforms import current_platform
+-from vllm.utils.torch_utils import direct_register_custom_op
++from vllm.utils.torch_utils import (
++    _USE_LAYERNAME,
++    LayerNameType,
++    _encode_layer_name,
++    _resolve_layer_name,
++    direct_register_custom_op,
++)
+ 
+ from ..inductor_pass import enable_fake_mode
+ from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+@@ -51,8 +57,9 @@ def fused_qk_norm_rope_and_unified_kv_cache_update_impl(
+     rms_norm_eps: float,
+     cos_sin_cache: torch.Tensor,
+     is_neox: bool,
+-    layer_name: str = "",
++    layer_name: LayerNameType,
+ ) -> torch.Tensor:
++    layer_name = _resolve_layer_name(layer_name)
+     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+     if layer_slot_mapping is not None:
+         attn_layer.impl.do_qk_norm_rope_kvcache_update(
+@@ -87,7 +94,7 @@ def fused_qk_norm_rope_and_unified_kv_cache_update_fake(
+     rms_norm_eps: float,
+     cos_sin_cache: torch.Tensor,
+     is_neox: bool,
+-    layer_name: str = "",
++    layer_name: LayerNameType,
+ ) -> torch.Tensor:
+     return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+ 
+@@ -166,6 +173,9 @@ class QkNormRopeKvCachePattern:
+         if self.quant_query:
+             q_scale = empty_fp32(1)
+             inputs += [q_scale]
++        if _USE_LAYERNAME:
++            # layer_name is an opaque graph input (wildcard) in this mode.
++            inputs.append(_encode_layer_name(self.layer_name))
+         return inputs
+ 
+     def pattern_non_fp8_quant_query(
+@@ -175,6 +185,7 @@ class QkNormRopeKvCachePattern:
+         q_weight: torch.Tensor,
+         k_weight: torch.Tensor,
+         cos_sin_cache: torch.Tensor,
++        layer_name: LayerNameType,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+         q_by_head = q.view(-1, self.q_size // self.head_size, self.head_size)
+@@ -190,7 +201,7 @@ class QkNormRopeKvCachePattern:
+         q_rope = q_rope.view(-1, self.num_heads, self.head_size)
+         k_rope = k_rope.view(-1, self.num_kv_heads, self.head_size)
+         v = v.view(-1, self.num_kv_heads, self.head_size_v)
+-        dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, self.layer_name)
++        dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, layer_name)
+         return dummy, q_rope, k_rope, v
+ 
+     def replacement_non_fp8_quant_query(
+@@ -200,6 +211,7 @@ class QkNormRopeKvCachePattern:
+         q_weight: torch.Tensor,
+         k_weight: torch.Tensor,
+         cos_sin_cache: torch.Tensor,
++        layer_name: LayerNameType,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         q_out = torch.empty(
+             qkv.shape[0],
+@@ -228,7 +240,7 @@ class QkNormRopeKvCachePattern:
+             rms_norm_eps=self.eps,
+             cos_sin_cache=cos_sin_cache,
+             is_neox=self.is_neox,
+-            layer_name=self.layer_name,
++            layer_name=layer_name,
+         )
+         return results[0], results[1], results[2], v
+ 
+@@ -240,6 +252,7 @@ class QkNormRopeKvCachePattern:
+         k_weight: torch.Tensor,
+         cos_sin_cache: torch.Tensor,
+         q_scale: torch.Tensor,
++        layer_name: LayerNameType,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+         q_by_head = q.view(-1, self.q_size // self.head_size, self.head_size)
+@@ -268,7 +281,7 @@ class QkNormRopeKvCachePattern:
+ 
+         k_rope = k_rope.view(-1, self.num_kv_heads, self.head_size)
+         v = v.view(-1, self.num_kv_heads, self.head_size_v)
+-        dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, self.layer_name)
++        dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, layer_name)
+         return dummy, q_rope_fp8, k_rope, v, q_scale_out
+ 
+     def replacement_fp8_quant_query(
+@@ -279,6 +292,7 @@ class QkNormRopeKvCachePattern:
+         k_weight: torch.Tensor,
+         cos_sin_cache: torch.Tensor,
+         q_scale: torch.Tensor,
++        layer_name: LayerNameType,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         q_out = torch.empty(
+             qkv.shape[0],
+@@ -307,7 +321,7 @@ class QkNormRopeKvCachePattern:
+             rms_norm_eps=self.eps,
+             cos_sin_cache=cos_sin_cache,
+             is_neox=self.is_neox,
+-            layer_name=self.layer_name,
++            layer_name=layer_name,
+         )
+         # Re-apply the quant on the kernel's bf16 q_out; fused op does not quant q.
+         # Same explicit auto_functionalized form as the pattern: [1] = quantized
+@@ -374,43 +388,98 @@ class QkNormRopeKvCachePattern:
+         )
+ 
+     def register(self, pm_pass: PatternMatcherPass) -> None:
+-        # make_fx counts `self` in bound-method code params; wrap as plain fns.
+-        # Distinct names per branch so mypy doesn't see one name, two signatures.
++        # With _USE_LAYERNAME the layer name is an opaque graph input and thus
++        # a wildcard in the pattern; otherwise it is a string constant baked
++        # into the pattern (one pattern per layer).
++        _ln = _encode_layer_name(self.layer_name)
+         if self.quant_query:
+-
+-            def pattern_q(qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale):
+-                return self.pattern_fp8_quant_query(
++            if _USE_LAYERNAME:
++
++                def pattern_q(
++                    qkv,
++                    positions,
++                    q_weight,
++                    k_weight,
++                    cos_sin_cache,
++                    q_scale,
++                    layer_name,
++                ):
++                    return self.pattern_fp8_quant_query(
++                        qkv,
++                        positions,
++                        q_weight,
++                        k_weight,
++                        cos_sin_cache,
++                        q_scale,
++                        layer_name,
++                    )
++
++                def replacement_q(
++                    qkv,
++                    positions,
++                    q_weight,
++                    k_weight,
++                    cos_sin_cache,
++                    q_scale,
++                    layer_name,
++                ):
++                    return self.replacement_fp8_quant_query(
++                        qkv,
++                        positions,
++                        q_weight,
++                        k_weight,
++                        cos_sin_cache,
++                        q_scale,
++                        layer_name,
++                    )
++            else:
++
++                def pattern_q(
+                     qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale
+-                )
++                ):
++                    return self.pattern_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale, _ln
++                    )
+ 
+-            def replacement_q(
+-                qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale
+-            ):
+-                return self.replacement_fp8_quant_query(
++                def replacement_q(
+                     qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale
+-                )
++                ):
++                    return self.replacement_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, q_scale, _ln
++                    )
+ 
+             self._register(pattern_q, replacement_q, pm_pass)
+         else:
+-
+-            def pattern_noq(qkv, positions, q_weight, k_weight, cos_sin_cache):
+-                return self.pattern_non_fp8_quant_query(
+-                    qkv, positions, q_weight, k_weight, cos_sin_cache
+-                )
+-
+-            def replacement_noq(qkv, positions, q_weight, k_weight, cos_sin_cache):
+-                return self.replacement_non_fp8_quant_query(
+-                    qkv, positions, q_weight, k_weight, cos_sin_cache
+-                )
++            if _USE_LAYERNAME:
++
++                def pattern_noq(
++                    qkv, positions, q_weight, k_weight, cos_sin_cache, layer_name
++                ):
++                    return self.pattern_non_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, layer_name
++                    )
++
++                def replacement_noq(
++                    qkv, positions, q_weight, k_weight, cos_sin_cache, layer_name
++                ):
++                    return self.replacement_non_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, layer_name
++                    )
++            else:
++
++                def pattern_noq(qkv, positions, q_weight, k_weight, cos_sin_cache):
++                    return self.pattern_non_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, _ln
++                    )
++
++                def replacement_noq(qkv, positions, q_weight, k_weight, cos_sin_cache):
++                    return self.replacement_non_fp8_quant_query(
++                        qkv, positions, q_weight, k_weight, cos_sin_cache, _ln
++                    )
+ 
+             self._register(pattern_noq, replacement_noq, pm_pass)
+ 
+ 
+-# ---------------------------------------------------------------------------
+-# Pass class
+-# ---------------------------------------------------------------------------
+-
+-
+ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
+     """Fuse QK-norm + RoPE + KV cache update into a single AITER HIP kernel.
+ 
+@@ -437,34 +506,57 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
+             )
+             return
+ 
++        # The fp8-query variants re-quantize Q with the AITER per-tensor quant
++        # op, which only exists on ROCm.
++        quant_query_options = [False, True] if current_platform.is_rocm() else [False]
+         attn_layers = get_layers_from_vllm_config(config, Attention)
+ 
+-        for _, layer in attn_layers.items():
+-            if not layer.impl.fused_qk_norm_rope_kvcache_supported():
+-                continue
+-            if layer.head_size not in SUPPORTED_FUSED_QK_NORM_ROPE_KVCACHE_HEAD_DIMS:
++        if _USE_LAYERNAME:
++            # layer_name is an opaque graph input, i.e. a wildcard: a single
++            # registration covers every attention layer. That is only sound
++            # when every layer is eligible and they all share one geometry
++            # (the replacement bakes in num_heads/num_kv_heads/head_size).
++            layers = list(attn_layers.values())
++            unsupported = [
++                r for r in (self._unsupported_reason(la) for la in layers) if r
++            ]
++            if unsupported:
+                 logger.warning_once(
+-                    "QK Norm+RoPE+KVCache fusion not enabled for a layer: "
+-                    "head_size=%d is not supported by the "
+-                    "fused_qk_norm_rope_cache_pts_quant_shuffle kernel "
+-                    "(supported: %s). Falling back to the unfused path.",
+-                    layer.head_size,
+-                    SUPPORTED_FUSED_QK_NORM_ROPE_KVCACHE_HEAD_DIMS,
++                    "QK Norm+RoPE+KVCache fusion not enabled: %s. Falling back "
++                    "to the unfused path for all layers.",
++                    unsupported[0],
+                 )
+-                continue
+-            if layer.head_size_v != layer.head_size:
+-                # The fused kernel uses a single head_dim for q/k/v.
++                return
++            geometries = {
++                (la.num_heads, la.num_kv_heads, la.head_size, la.head_size_v)
++                for la in layers
++            }
++            if len(geometries) > 1:
+                 logger.warning_once(
+-                    "QK Norm+RoPE+KVCache fusion not enabled for a layer: "
+-                    "head_size_v=%d differs from head_size=%d, which the fused "
+-                    "kernel does not support. Falling back to the unfused path.",
+-                    layer.head_size_v,
+-                    layer.head_size,
++                    "QK Norm+RoPE+KVCache fusion not enabled: attention layers "
++                    "have different geometries %s, which a single wildcard "
++                    "pattern cannot cover. Falling back to the unfused path.",
++                    sorted(geometries),
+                 )
+-                continue
++                return
++            layers = layers[:1]
++        else:
++            layers = []
++            for layer in attn_layers.values():
++                reason = self._unsupported_reason(layer)
++                if reason:
++                    logger.warning_once(
++                        "QK Norm+RoPE+KVCache fusion not enabled for a layer: "
++                        "%s. Falling back to the unfused path.",
++                        reason,
++                    )
++                    continue
++                layers.append(layer)
++
++        for layer in layers:
+             for epsilon in [1e-5, 1e-6]:
+                 for neox in [True, False]:
+-                    for quant_q in [False, True]:
++                    for quant_q in quant_query_options:
+                         QkNormRopeKvCachePattern(
+                             layer=layer,
+                             eps=epsilon,
+@@ -474,12 +566,30 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
+ 
+         self.dump_patterns(config, self.patterns)
+ 
++    @staticmethod
++    def _unsupported_reason(layer: Attention) -> str | None:
++        if not layer.impl.fused_qk_norm_rope_kvcache_supported():
++            return f"{type(layer.impl).__name__} does not support the fusion"
++        if layer.head_size not in SUPPORTED_FUSED_QK_NORM_ROPE_KVCACHE_HEAD_DIMS:
++            return (
++                f"head_size={layer.head_size} is not supported by the fused "
++                "QK-norm+RoPE+KV-cache kernel (supported: "
++                f"{SUPPORTED_FUSED_QK_NORM_ROPE_KVCACHE_HEAD_DIMS})"
++            )
++        if layer.head_size_v != layer.head_size:
++            # The fused kernel uses a single head_dim for q/k/v.
++            return (
++                f"head_size_v={layer.head_size_v} differs from "
++                f"head_size={layer.head_size}"
++            )
++        return None
++
+     @VllmInductorPass.time_and_log
+     def __call__(self, graph: fx.Graph) -> None:
+         self.matched_count = self.patterns.apply(graph)
+         logger.info(
+             "QK-Norm+RoPE+KVCache fusion: replaced %s pattern(s) "
+-            "with AITER fused_qk_norm_rope_cache_pts_quant_shuffle",
++            "with fused_qk_norm_rope_and_unified_kv_cache_update",
+             self.matched_count,
+         )
+ 
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 8ccc7332bd..029b6ed9b8 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -154,10 +154,12 @@ class PassConfig:
+     fuse_rope_kvcache: bool = None  # type: ignore[assignment]
+     """Fuse the QK rope + KV cache ops."""
+     fuse_qk_norm_rope_kvcache: bool = Field(default=None)  # type: ignore[assignment]
+-    """Fuse QK RMSNorm + RoPE + KV cache update into a single AITER HIP
+-    kernel. Supersedes both enable_qk_norm_rope_fusion and fuse_rope_kvcache
+-    for layers that support it. Auto-enabled at O1+ on ROCm for models
+-    with QK-norm (e.g. Qwen3-MoE)."""
++    """Fuse QK RMSNorm + RoPE + KV cache update into a single kernel (AITER
++    HIP kernel on ROCm, fused_qk_norm_rope_kvcache on CUDA with the
++    FlashAttention backend and an unquantized KV cache). Supersedes both
++    enable_qk_norm_rope_fusion and fuse_rope_kvcache for layers that support
++    it. Auto-enabled at O1+ on ROCm for models with QK-norm (e.g. Qwen3-MoE);
++    opt-in on CUDA."""
+ 
+     rope_kvcache_fusion_max_token_num: int = 256
+     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
+@@ -299,9 +301,9 @@ class PassConfig:
+                 "The fusion will be disabled."
+             )
+             self.fuse_rope_kvcache = False
+-        if self.fuse_qk_norm_rope_kvcache and not current_platform.is_rocm():
++        if self.fuse_qk_norm_rope_kvcache and not current_platform.is_cuda_alike():
+             logger.warning_once(
+-                "QK-Norm+RoPE+KVCache fusion requires ROCm with AITER. "
++                "QK-Norm+RoPE+KVCache fusion requires CUDA or ROCm with AITER. "
+                 "The fusion will be disabled."
+             )
+             self.fuse_qk_norm_rope_kvcache = False
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 321c76fe30..b445f87da2 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -197,6 +197,29 @@ class SchedulerConfig:
+     once every N engine steps, aligned across DP ranks, to better balance
+     per-step forward-pass times."""
+ 
++    cache_aware_admission_window: int = Field(default=0, ge=0)
++    """Look-ahead window for cache-aware admission. Within the first N waiting
++    requests, those whose prefix is already in the KV cache are admitted ahead
++    of requests that would have to compute theirs, so a cold request does not
++    evict blocks a resident one still needs. 0 (the default) admits strictly in
++    arrival order.
++
++    Reordering is confined to the window and to requests that are merely
++    waiting, so a request that is blocked or already partially computed keeps
++    its position and nothing is moved past it. Requires prefix caching and the
++    "fcfs" policy; it is ignored otherwise. Costs one prefix-cache lookup per
++    request in the window per step, so prefer the smallest window that spans
++    the usual queue depth."""
++
++    cache_aware_admission_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
++    """KV cache usage below which `cache_aware_admission_window` is not applied.
++
++    Defaults to 0.5, so the window engages only once the cache is at least half
++    used. Below that there is room for both prompts and reordering would change
++    admission order without an eviction to avoid, which is a fairness cost for
++    no benefit. It also means the per-request cache probe is skipped entirely
++    while the cache is roomy. Set to 0.0 to reorder on every step."""
++
+     async_scheduling: bool | None = None
+     """If set to False, disable async scheduling. Async scheduling helps to
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 67d8a2f2a0..5c8b38d180 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -664,6 +664,10 @@ class EngineArgs:
+ 
+     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
+     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
++    cache_aware_admission_window: int = SchedulerConfig.cache_aware_admission_window
++    cache_aware_admission_threshold: float = (
++        SchedulerConfig.cache_aware_admission_threshold
++    )
+ 
+     watermark: float = SchedulerConfig.watermark
+ 
+@@ -1651,6 +1655,14 @@ class EngineArgs:
+             "--prefill-schedule-interval",
+             **scheduler_kwargs["prefill_schedule_interval"],
+         )
++        scheduler_group.add_argument(
++            "--cache-aware-admission-window",
++            **scheduler_kwargs["cache_aware_admission_window"],
++        )
++        scheduler_group.add_argument(
++            "--cache-aware-admission-threshold",
++            **scheduler_kwargs["cache_aware_admission_threshold"],
++        )
+         scheduler_group.add_argument(
+             "--disable-hybrid-kv-cache-manager",
+             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
+@@ -2460,6 +2472,8 @@ class EngineArgs:
+             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
+             watermark=self.watermark,
+             prefill_schedule_interval=self.prefill_schedule_interval,
++            cache_aware_admission_window=self.cache_aware_admission_window,
++            cache_aware_admission_threshold=self.cache_aware_admission_threshold,
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+             async_scheduling=self.async_scheduling,
+             stream_interval=self.stream_interval,
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index b57af3fd29..2218c29486 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -21,6 +21,7 @@ from vllm.utils.torch_utils import (
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionImpl,
++    AttentionLayer,
+     AttentionType,
+     MultipleOf,
+ )
+@@ -54,6 +55,7 @@ if is_flash_attn_varlen_func_available():
+         reshape_and_cache_flash,
+     )
+ import vllm.envs as envs
++from vllm._custom_ops import fused_qk_norm_rope_kvcache
+ from vllm.config import (
+     VllmConfig,
+     get_current_vllm_config_or_none,
+@@ -1084,11 +1086,16 @@ class FlashAttentionImpl(AttentionImpl):
+             logits_soft_cap = 0
+         self.logits_soft_cap = logits_soft_cap
+         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
++        self.dcp_world_size = 1
+ 
+         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+ 
+         self.attn_type = attn_type
+         vllm_config = get_current_vllm_config_or_none()
++        if vllm_config is not None:
++            self.dcp_world_size = (
++                vllm_config.parallel_config.decode_context_parallel_size
++            )
+         uses_kv_cache = attn_type not in (
+             AttentionType.ENCODER,
+             AttentionType.ENCODER_ONLY,
+@@ -1478,6 +1485,56 @@ class FlashAttentionImpl(AttentionImpl):
+             layer._v_scale,
+         )
+ 
++    def fused_qk_norm_rope_kvcache_supported(self) -> bool:
++        # The CUDA fused_qk_norm_rope_kvcache kernel writes K/V straight into
++        # the flash-layout cache. It supports the unquantized cache only, one
++        # head_dim for Q/K/V, decoder layers that own their cache, and no
++        # decode context parallelism (each rank writes only its own K/V).
++        return (
++            current_platform.is_cuda()
++            and self.kv_cache_dtype == "auto"
++            and self.attn_type == AttentionType.DECODER
++            and self.kv_sharing_target_layer_name is None
++            and self.head_size in (64, 128, 256)
++            and self.dcp_world_size == 1
++        )
++
++    def do_qk_norm_rope_kvcache_update(
++        self,
++        layer: AttentionLayer,
++        qkv: torch.Tensor,
++        q_out: torch.Tensor,
++        k_out: torch.Tensor,
++        positions: torch.Tensor,
++        q_weight: torch.Tensor,
++        k_weight: torch.Tensor,
++        rms_norm_eps: float,
++        cos_sin_cache: torch.Tensor,
++        is_neox: bool,
++        kv_cache: torch.Tensor,
++        layer_slot_mapping: torch.Tensor,
++    ) -> None:
++        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D)), as in do_kv_cache_update.
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
++        fused_qk_norm_rope_kvcache(
++            qkv,
++            q_out,
++            k_out,
++            self.num_heads,
++            self.num_kv_heads,
++            self.num_kv_heads,
++            self.head_size,
++            rms_norm_eps,
++            q_weight,
++            k_weight,
++            cos_sin_cache,
++            is_neox,
++            positions,
++            key_cache,
++            value_cache,
++            layer_slot_mapping,
++        )
++
+     def _forward_with_dcp(
+         self,
+         query: torch.Tensor,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 1adf386cab..2a130dbf83 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -250,6 +250,28 @@ class KVCacheManager:
+         """Whether a local prefix cache lookup may be run for this request."""
+         return self.enable_caching and not request.skip_reading_prefix_cache
+ 
++    def get_num_cached_tokens(self, request: Request) -> int:
++        """How many of a request's tokens are already in the prefix cache.
++
++        Unlike `get_computed_blocks`, this only probes the cache: it takes no
++        references, allocates no blocks and emits no events, so it is safe to
++        call for a request that may not be scheduled.
++
++        Args:
++            request: The request to probe.
++
++        Returns:
++            The number of cached tokens, or 0 if lookup is disabled.
++
++        """
++        if not self.prefix_cache_lookup_enabled(request):
++            return 0
++        # Mirrors `get_computed_blocks`: the last token is always recomputed.
++        _, num_computed_tokens, _ = self.coordinator.find_longest_cache_hit(
++            request.block_hashes, request.num_tokens - 1
++        )
++        return num_computed_tokens
++
+     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
+         # Don't count a request that skipped the cache lookup.
+         if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 19ac16284c..2484a75573 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -340,6 +340,17 @@ class Scheduler(SchedulerInterface):
+         self.scheduler_reserve_full_isl = (
+             self.scheduler_config.scheduler_reserve_full_isl
+         )
++        # Cache-aware admission needs a prefix cache to consult, and reorders by
++        # position, which only a FCFS queue has.
++        self.cache_aware_window = (
++            self.scheduler_config.cache_aware_admission_window
++            if self.policy == SchedulingPolicy.FCFS
++            and self.cache_config.enable_prefix_caching
++            else 0
++        )
++        self.cache_aware_threshold = (
++            self.scheduler_config.cache_aware_admission_threshold
++        )
+ 
+         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+@@ -862,6 +873,16 @@ class Scheduler(SchedulerInterface):
+ 
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
++            # Match the admission slot limit before probing cached prefixes.
++            # Paused streaming sessions also retain a model-runner slot.
++            if (
++                self.cache_aware_window
++                and not defer_prefills
++                and len(self.running) + self.num_waiting_for_streaming_input
++                < self.max_num_active_reqs
++            ):
++                self._reorder_waiting_by_cached_prefix()
++
+             step_skipped_waiting = create_request_queue(self.policy)
+ 
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+@@ -2391,6 +2412,46 @@ class Scheduler(SchedulerInterface):
+         else:
+             self.waiting.add_request(request)
+ 
++    def _reorder_waiting_by_cached_prefix(self) -> None:
++        """Move waiting requests with a cached prefix to the front of the window.
++
++        Reordering is confined to the slots held by plain waiting requests, so a
++        request in a blocked status or one already partially computed keeps its
++        exact position and nothing is moved past it. That keeps this a
++        reordering among peers rather than a change in priority, and leaves the
++        queue beyond the window untouched.
++        """
++        if len(self.waiting) < 2:
++            return
++        if self.kv_cache_manager.usage < self.cache_aware_threshold:
++            return
++
++        head = list(itertools.islice(self.waiting, self.cache_aware_window))
++        slots = [
++            i
++            for i, request in enumerate(head)
++            if request.status == RequestStatus.WAITING
++            and not request.num_computed_tokens
++        ]
++        if len(slots) < 2:
++            return
++
++        # Deepest cached prefix first, arrival order breaking ties.
++        get_num_cached = self.kv_cache_manager.get_num_cached_tokens
++        cached = {i: get_num_cached(head[i]) for i in slots}
++        order = sorted(slots, key=lambda i: (-cached[i], i))
++        if order == slots:
++            return
++
++        reordered = list(head)
++        for slot, source in zip(slots, order):
++            reordered[slot] = head[source]
++        # One pass to drop the whole window, then re-insert in the new order;
++        # removing each request individually would be quadratic.
++        self.waiting.remove_requests(head)
++        for request in reversed(reordered):
++            self.waiting.prepend_request(request)
++
+     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+         if self.policy == SchedulingPolicy.FCFS:
+             return self.skipped_waiting or self.waiting or None

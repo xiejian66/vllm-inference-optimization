@@ -1,0 +1,30 @@
+{
+  "A4 -> B4_OFF": {
+    "exact": false,
+    "max_abs": 0.09375,
+    "mean_abs": 0.014173166015873512,
+    "relative_l2": 0.005319627141211051,
+    "argmax_agreement": 1.0
+  },
+  "B4_OFF -> C4_OFF": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.008833934135951585,
+    "relative_l2": 0.003694511279235027,
+    "argmax_agreement": 1.0
+  },
+  "C4_OFF -> C4_ON": {
+    "exact": false,
+    "max_abs": 0.125,
+    "mean_abs": 0.012339245016814509,
+    "relative_l2": 0.004691585655831262,
+    "argmax_agreement": 1.0
+  },
+  "A4 -> C4_ON": {
+    "exact": false,
+    "max_abs": 0.109375,
+    "mean_abs": 0.009711657204330218,
+    "relative_l2": 0.003980609715993673,
+    "argmax_agreement": 1.0
+  }
+}

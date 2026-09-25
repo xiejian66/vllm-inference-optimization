@@ -1,0 +1,14 @@
+{
+  "project": "QwenFuse",
+  "upstream": "https://github.com/vllm-project/vllm.git",
+  "source_ref": "main",
+  "commit": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+  "source_directory": "/root/data/qwenfuse/src/vllm-main-20260920",
+  "branch": "qwenfuse/main-20260920",
+  "previous_directory": "/root/data/qwenfuse/src/vllm",
+  "previous_commit": "275de34170654274616082721348b7edd9741d32",
+  "recorded_at": "2026-09-20T14:24:12.362821+00:00",
+  "fetch_depth": 1,
+  "transfer": "Official Git fetch locally, SHA256-verified SSH transfer",
+  "validation": "Git commit and clean worktree verified; dependencies, build and GPU execution not validated"
+}

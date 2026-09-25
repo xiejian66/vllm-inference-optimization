@@ -1,0 +1,79 @@
+{
+  "A4 repeat": {
+    "exact": true,
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "argmax_agreement": 1.0
+  },
+  "C4 repeat": {
+    "exact": true,
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "argmax_agreement": 1.0
+  },
+  "S0 repeat": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028253433373625777,
+    "argmax_agreement": 1.0
+  },
+  "S1 repeat": {
+    "exact": false,
+    "max_abs": 0.0859375,
+    "mean_abs": 0.010583774300438071,
+    "relative_l2": 0.004182621431613219,
+    "argmax_agreement": 1.0
+  },
+  "JOINT repeat": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028273687462973427,
+    "argmax_agreement": 1.0
+  },
+  "A4->C4 repeat1": {
+    "exact": false,
+    "max_abs": 0.09375,
+    "mean_abs": 0.00990880479394335,
+    "relative_l2": 0.004010407243085131,
+    "argmax_agreement": 1.0
+  },
+  "S0->S1 repeat1": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.009202819179936785,
+    "relative_l2": 0.0037788101255550616,
+    "argmax_agreement": 1.0
+  },
+  "S0->JOINT repeat1": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028253433373625777,
+    "argmax_agreement": 1.0
+  },
+  "A4->C4 repeat2": {
+    "exact": false,
+    "max_abs": 0.09375,
+    "mean_abs": 0.00990880479394335,
+    "relative_l2": 0.004010407243085131,
+    "argmax_agreement": 1.0
+  },
+  "S0->S1 repeat2": {
+    "exact": false,
+    "max_abs": 0.0625,
+    "mean_abs": 0.010927381440063692,
+    "relative_l2": 0.0042671376119977796,
+    "argmax_agreement": 1.0
+  },
+  "S0->JOINT repeat2": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028273687462973427,
+    "argmax_agreement": 1.0
+  }
+}

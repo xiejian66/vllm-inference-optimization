@@ -1,0 +1,22 @@
+{
+  "base_commit": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+  "source_files": 7221,
+  "variants": {
+    "B": {
+      "head": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+      "patch_sha256": "d693bcd4ba2d9d23128983c404809cb97cb962532dec55e083dbf99705d76deb",
+      "status": "M  csrc/libtorch_stable/fused_qknorm_rope_kernel.cu\nM  csrc/libtorch_stable/ops.h\nM  csrc/libtorch_stable/torch_bindings.cpp\nA  tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py\nA  tests/kernels/core/test_fused_qk_norm_rope_kvcache.py\nM  vllm/_custom_ops.py\nM  vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py\nM  vllm/config/compilation.py\nM  vllm/v1/attention/backends/flash_attn.py\n"
+    },
+    "C": {
+      "head": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+      "patch_sha256": "7ad2c26f2f416184a01737dfc3279e37375a5c4cfde88f6606892167791194f7",
+      "status": "MM csrc/libtorch_stable/fused_qknorm_rope_kernel.cu\nM  csrc/libtorch_stable/ops.h\nM  csrc/libtorch_stable/torch_bindings.cpp\nA  tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py\nA  tests/kernels/core/test_fused_qk_norm_rope_kvcache.py\nM  vllm/_custom_ops.py\nM  vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py\nM  vllm/config/compilation.py\nM  vllm/v1/attention/backends/flash_attn.py\n?? csrc/libtorch_stable/fused_qknorm_rope_kernel.cu.before-reg-cossin\n"
+    },
+    "D": {
+      "head": "27757dde020ecda4f9b0e2c5ca2df1c29badc82f",
+      "patch_sha256": "4db5262732f9f8fcd78b6965c3d9536db91cb8b72870e7a56b3cd682b43f581d",
+      "status": "M  csrc/libtorch_stable/fused_qknorm_rope_kernel.cu\nM  csrc/libtorch_stable/ops.h\nM  csrc/libtorch_stable/torch_bindings.cpp\nA  tests/compile/passes/test_qk_norm_rope_kvcache_fusion.py\nA  tests/kernels/core/test_fused_qk_norm_rope_kvcache.py\n M tests/v1/core/test_scheduler.py\n M tests/v1/core/utils.py\nM  vllm/_custom_ops.py\nM  vllm/compilation/passes/fusion/qk_norm_rope_kvcache_fusion.py\nM  vllm/config/compilation.py\n M vllm/config/scheduler.py\n M vllm/engine/arg_utils.py\nM  vllm/v1/attention/backends/flash_attn.py\n M vllm/v1/core/kv_cache_manager.py\n M vllm/v1/core/sched/scheduler.py\n?? tests/v1/core/utils.py.before-cache-aware-admission\n"
+    }
+  },
+  "selected_result_files": 211
+}

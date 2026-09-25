@@ -1,0 +1,183 @@
+{
+  "job": {
+    "id": "random8-seed20260925-r2-S0",
+    "kind": "model",
+    "variant": "S0",
+    "scenario": "random8",
+    "seed": 20260925,
+    "round": 2,
+    "verify": false,
+    "samples": 3,
+    "purpose": "main"
+  },
+  "results": [
+    {
+      "batch": 64,
+      "workload_sha256": "6cf1e0f207192ac9dbb0e2d62ed8480f0916ebce33794d4455902cfffe96a04e",
+      "latency": {
+        "n": 3,
+        "median": 28.121232380999572,
+        "std": 0.05087833760685283,
+        "min": 28.037859470998228,
+        "max": 28.13006853600018,
+        "p10": 28.0545340529985,
+        "p90": 28.128301305000058
+      },
+      "throughput": {
+        "n": 3,
+        "median": 582.6202699092958,
+        "std": 1.0570409670842111,
+        "min": 582.437258516884,
+        "max": 584.3527397998148,
+        "p10": 582.4738607953664,
+        "p90": 584.006245821711
+      },
+      "preemptions": 0,
+      "cold": {
+        "ttft_s": {
+          "n": 96,
+          "median": 8.452130436897278,
+          "std": 7.783618642970157,
+          "min": 0.3486487865447998,
+          "max": 23.040257930755615,
+          "p10": 0.8443058729171753,
+          "p90": 21.81169104576111
+        },
+        "tpot_s": {
+          "n": 96,
+          "median": 0.02612378955882199,
+          "std": 0.0019676077783670988,
+          "min": 0.019816089325482324,
+          "max": 0.027897387352947823,
+          "p10": 0.024050678990191525,
+          "p90": 0.02759710251960439
+        },
+        "engine_residence_s": {
+          "n": 96,
+          "median": 14.971469714500927,
+          "std": 7.767822667408869,
+          "min": 6.690232460001425,
+          "max": 27.923678148999898,
+          "p10": 6.919213851500899,
+          "p90": 27.764115564999884
+        },
+        "queue_s": {
+          "n": 96,
+          "median": 7.924964802499744,
+          "std": 7.786775827857691,
+          "min": 7.285998435690999e-06,
+          "max": 22.64220337200095,
+          "p10": 0.3266255694998108,
+          "p90": 21.28436257249996
+        }
+      },
+      "warm": {
+        "ttft_s": {
+          "n": 96,
+          "median": 14.298712253570557,
+          "std": 7.923848751794254,
+          "min": 0.8439841270446777,
+          "max": 23.07405662536621,
+          "p10": 1.017253041267395,
+          "p90": 22.7666894197464
+        },
+        "tpot_s": {
+          "n": 96,
+          "median": 0.025466914139214362,
+          "std": 0.002470973109750941,
+          "min": 0.019752264733331543,
+          "max": 0.027701512886272338,
+          "p10": 0.02060165666079425,
+          "p90": 0.0275511519039177
+        },
+        "engine_residence_s": {
+          "n": 96,
+          "median": 21.106283917000837,
+          "std": 7.668649792256757,
+          "min": 6.908680638000078,
+          "max": 27.941909072997078,
+          "p10": 6.995283827998719,
+          "p90": 27.833399867999105
+        },
+        "queue_s": {
+          "n": 96,
+          "median": 13.831359313000576,
+          "std": 7.903585441388281,
+          "min": 0.4913171259977389,
+          "max": 22.8619713879998,
+          "p10": 0.6585008580004796,
+          "p90": 22.323557211999287
+        }
+      },
+      "warm_cached_by_sample": [
+        40960,
+        40960,
+        40960
+      ],
+      "warm_cached_by_occurrence": {
+        "0": [
+          16384,
+          16384,
+          16384
+        ],
+        "1": [
+          24576,
+          24576,
+          24576
+        ]
+      }
+    }
+  ],
+  "native": "/root/data/qwenfuse/reports/resume-metrics-20260924-225223/binaries/A4/_C_stable_libtorch.abi3.so",
+  "native_sha256": "f7627651069590ad5cf2305aa860e5cde2e98064a856eb3db533bb61fe53355f",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "settings": {
+    "model": "/root/data/qwenfuse/models/Qwen3-8B",
+    "dtype": "bfloat16",
+    "quantization": null,
+    "kv_cache_dtype": "auto",
+    "tensor_parallel_size": 1,
+    "seed": 42,
+    "max_model_len": 4096,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 2048,
+    "block_size": 16,
+    "kv_cache_memory_bytes": 8589934592,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "async_scheduling": false,
+    "scheduling_policy": "fcfs",
+    "enforce_eager": false,
+    "skip_tokenizer_init": true,
+    "generation_config": "vllm",
+    "disable_log_stats": false,
+    "attention_config": {
+      "backend": "FLASH_ATTN",
+      "flash_attn_version": 2
+    },
+    "compilation_config": {
+      "mode": 3,
+      "compile_ranges_endpoints": [
+        256,
+        4096
+      ],
+      "cudagraph_mode": "PIECEWISE",
+      "cudagraph_capture_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "use_inductor_graph_partition": true,
+      "pass_config": {
+        "enable_qk_norm_rope_fusion": true,
+        "fuse_qk_norm_rope_kvcache": false,
+        "fuse_rope_kvcache": false,
+        "rope_kvcache_fusion_max_token_num": 256
+      }
+    }
+  },
+  "note": "Burst completion wall time; not sustained service throughput. Logits assessed separately. Prefix warmup excluded."
+}

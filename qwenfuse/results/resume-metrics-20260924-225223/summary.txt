@@ -1,0 +1,178 @@
+A4/B4/C4 micro and anomaly force heads/warp=4.
+S0/S1: official native library, auto warp; JOINT: C4 native forced4 + final risk scheduler.
+All performance uses unprofiled timing, after warmup. Burst workload, not sustained serving.
+Positive reduction means lower latency; throughput gain is reported separately.
+
+MICRO: round tokens A4_us B4_us C4_us A4_B4% B4_C4% A4_C4%
+1 1 13.792 10.328 8.272 +25.12 +19.91 +40.02
+1 8 12.080 11.856 7.488 +1.85 +36.84 +38.01
+1 32 14.116 10.288 9.504 +27.12 +7.62 +32.67
+1 64 9.608 9.416 8.016 +2.00 +14.87 +16.57
+1 128 12.880 8.900 10.520 +30.90 -18.20 +18.32
+1 256 18.368 14.176 10.224 +22.82 +27.88 +44.34
+2 1 9.880 7.792 8.088 +21.13 -3.80 +18.14
+2 8 16.644 11.736 10.296 +29.49 +12.27 +38.14
+2 32 12.640 7.848 8.088 +37.91 -3.06 +36.01
+2 64 10.760 11.484 8.592 -6.73 +25.18 +20.15
+2 128 15.584 13.028 9.888 +16.40 +24.10 +36.55
+2 256 15.864 12.496 11.924 +21.23 +4.58 +24.84
+3 1 11.928 9.456 9.408 +20.72 +0.51 +21.13
+3 8 11.008 11.088 10.280 -0.73 +7.29 +6.61
+3 32 10.112 10.992 9.496 -8.70 +13.61 +6.09
+3 64 15.656 11.472 10.032 +26.72 +12.55 +35.92
+3 128 18.792 9.808 8.136 +47.81 +17.05 +56.70
+3 256 14.296 19.056 12.028 -33.30 +36.88 +15.86
+
+END-TO-END: purpose scenario seed round batch variant median_s tok_s warm_cached warm_TTFT cold_TTFT
+anomaly operator 191840815 1 8 A4 2.318410 441.68 [] None None
+anomaly operator 191840815 1 8 C4 2.301993 444.83 [] None None
+  A4->C4: latency +0.71% throughput +0.71%
+anomaly operator 191840815 2 8 C4 2.625944 389.95 [] None None
+anomaly operator 191840815 2 8 A4 2.650479 386.35 [] None None
+  A4->C4: latency +0.93% throughput +0.93%
+control cold8 191840815 1 64 S0 31.315844 523.19 [0, 0, 0] None 13.2462477684021
+control cold8 191840815 1 64 S1 31.387214 522.00 [0, 0, 0] None 13.263574957847595
+  S0->S1: latency -0.23% throughput -0.23%
+control cold8 191840815 2 64 S1 31.391774 521.92 [0, 0, 0] None 13.243504285812378
+control cold8 191840815 2 64 S0 31.459441 520.80 [0, 0, 0] None 13.282704472541809
+  S0->S1: latency +0.22% throughput +0.22%
+control random16 191840815 1 64 S0 26.074339 628.36 [65536, 65536, 65536] 7.509855031967163 13.396843314170837
+control random16 191840815 1 64 S1 26.070367 628.45 [65536, 65536, 65536] 7.532371997833252 13.391839981079102
+  S0->S1: latency +0.02% throughput +0.02%
+control random16 191840815 2 64 S1 26.113141 627.42 [65536, 65536, 65536] 7.523386716842651 13.418997287750244
+control random16 191840815 2 64 S0 26.069003 628.49 [65536, 65536, 65536] 7.499924421310425 13.396871447563171
+  S0->S1: latency -0.17% throughput -0.17%
+main random8 20260925 1 64 S0 28.011296 584.91 [40960, 40960, 40960] 14.232853055000305 8.418488144874573
+main random8 20260925 1 64 S1 26.584013 616.31 [59392, 59392, 59392] 6.988074541091919 13.40215790271759
+main random8 20260925 1 64 JOINT 26.366991 621.38 [59392, 59392, 59392] 6.9264315366744995 13.291893482208252
+  S0->S1: latency +5.10% throughput +5.37%
+  S0->JOINT: latency +5.87% throughput +6.24%
+  S1->JOINT: latency +0.82% throughput +0.82%
+main random8 20260925 2 64 JOINT 26.466331 619.05 [59392, 59392, 59392] 6.950942039489746 13.327361941337585
+main random8 20260925 2 64 S1 26.642480 614.96 [59392, 59392, 59392] 6.980018496513367 13.616256475448608
+main random8 20260925 2 64 S0 28.121232 582.62 [40960, 40960, 40960] 14.298712253570557 8.452130436897278
+  S0->S1: latency +5.26% throughput +5.55%
+  S0->JOINT: latency +5.88% throughput +6.25%
+  S1->JOINT: latency +0.66% throughput +0.67%
+main random8 20260926 1 64 S0 27.956484 586.05 [42864, 42848, 42864] 7.94954240322113 13.677615642547607
+main random8 20260926 1 64 S1 26.343403 621.94 [61264, 61264, 61264] 6.764234304428101 13.446905016899109
+main random8 20260926 1 64 JOINT 26.159084 626.32 [61264, 61264, 61264] 6.720912575721741 13.36818516254425
+  S0->S1: latency +5.77% throughput +6.12%
+  S0->JOINT: latency +6.43% throughput +6.87%
+  S1->JOINT: latency +0.70% throughput +0.70%
+main random8 20260926 2 64 JOINT 26.250729 624.14 [61264, 61264, 61264] 6.734636545181274 13.478755235671997
+main random8 20260926 2 64 S1 28.728051 570.31 [61264, 61264, 61264] 7.5464866161346436 14.884899258613586
+main random8 20260926 2 64 S0 28.046564 584.17 [42864, 42864, 42864] 7.97169828414917 13.7281653881073
+  S0->S1: latency -2.43% throughput -2.37%
+  S0->JOINT: latency +6.40% throughput +6.84%
+  S1->JOINT: latency +8.62% throughput +9.44%
+main random8 191840815 1 64 S0 27.346299 599.13 [44752, 44768, 44752] 7.531451463699341 14.086033940315247
+main random8 191840815 1 64 S1 26.126749 627.10 [61440, 61440, 61440] 6.732318043708801 13.333789587020874
+main random8 191840815 1 64 JOINT 26.023653 629.58 [61440, 61440, 61440] 6.6982293128967285 13.270980715751648
+  S0->S1: latency +4.46% throughput +4.67%
+  S0->JOINT: latency +4.84% throughput +5.08%
+  S1->JOINT: latency +0.39% throughput +0.40%
+main random8 191840815 2 64 JOINT 26.342250 621.97 [61440, 61440, 61440] 6.786073088645935 13.434447407722473
+main random8 191840815 2 64 S1 26.511045 618.01 [61440, 61440, 61440] 6.816723465919495 13.507247805595398
+main random8 191840815 2 64 S0 27.742194 590.58 [44768, 44768, 44768] 7.627297282218933 14.285947680473328
+  S0->S1: latency +4.44% throughput +4.64%
+  S0->JOINT: latency +5.05% throughput +5.31%
+  S1->JOINT: latency +0.64% throughput +0.64%
+
+PAIRED SUMMARY (all predeclared seeds, no best-seed selection):
+('anomaly', 'operator', 'A4', 'C4'): n=2, latency median=+0.82%, range=[+0.71,+0.93]%, faster=2/2, throughput median=+0.82%
+('control', 'cold8', 'S0', 'S1'): n=2, latency median=-0.01%, range=[-0.23,+0.22]%, faster=1/2, throughput median=-0.01%
+('control', 'random16', 'S0', 'S1'): n=2, latency median=-0.08%, range=[-0.17,+0.02]%, faster=1/2, throughput median=-0.08%
+('main', 'random8', 'S0', 'S1'): n=6, latency median=+4.78%, range=[-2.43,+5.77]%, faster=5/6, throughput median=+5.02%
+('main', 'random8', 'S0', 'JOINT'): n=6, latency median=+5.88%, range=[+4.84,+6.43]%, faster=6/6, throughput median=+6.24%
+('main', 'random8', 'S1', 'JOINT'): n=6, latency median=+0.68%, range=[+0.39,+8.62]%, faster=6/6, throughput median=+0.69%
+
+NUMERICAL REVIEW:
+{
+  "A4 repeat": {
+    "exact": true,
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "argmax_agreement": 1.0
+  },
+  "C4 repeat": {
+    "exact": true,
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "relative_l2": 0.0,
+    "argmax_agreement": 1.0
+  },
+  "S0 repeat": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028253433373625777,
+    "argmax_agreement": 1.0
+  },
+  "S1 repeat": {
+    "exact": false,
+    "max_abs": 0.0859375,
+    "mean_abs": 0.010583774300438071,
+    "relative_l2": 0.004182621431613219,
+    "argmax_agreement": 1.0
+  },
+  "JOINT repeat": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028273687462973427,
+    "argmax_agreement": 1.0
+  },
+  "A4->C4 repeat1": {
+    "exact": false,
+    "max_abs": 0.09375,
+    "mean_abs": 0.00990880479394335,
+    "relative_l2": 0.004010407243085131,
+    "argmax_agreement": 1.0
+  },
+  "S0->S1 repeat1": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.009202819179936785,
+    "relative_l2": 0.0037788101255550616,
+    "argmax_agreement": 1.0
+  },
+  "S0->JOINT repeat1": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028253433373625777,
+    "argmax_agreement": 1.0
+  },
+  "A4->C4 repeat2": {
+    "exact": false,
+    "max_abs": 0.09375,
+    "mean_abs": 0.00990880479394335,
+    "relative_l2": 0.004010407243085131,
+    "argmax_agreement": 1.0
+  },
+  "S0->S1 repeat2": {
+    "exact": false,
+    "max_abs": 0.0625,
+    "mean_abs": 0.010927381440063692,
+    "relative_l2": 0.0042671376119977796,
+    "argmax_agreement": 1.0
+  },
+  "S0->JOINT repeat2": {
+    "exact": false,
+    "max_abs": 0.078125,
+    "mean_abs": 0.005093834680687909,
+    "relative_l2": 0.0028273687462973427,
+    "argmax_agreement": 1.0
+  }
+}
+
+LIMITS:
+No model error tolerance preapproved. Exact differences require explanation, not automatic acceptance.
+Fixed-history finite logits are not model task-accuracy validation.
+Cold/warm TTFT, TPOT, queue median/max and preemptions are in every stage/result.json.
+15% spread is a screening flag, not a significance test.
+Timing screening flags: 17
+No P99, memory reduction, maximum concurrency, or sustained-arrival fairness claims.
+No NCU collection in this script. Existing counter evidence remains separate.

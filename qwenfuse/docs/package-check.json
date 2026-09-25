@@ -1,0 +1,19 @@
+{
+  "copied_source_files_verified": 7219,
+  "python_files_parsed": 46,
+  "selected_result_files": 211,
+  "bytes": 118419734,
+  "git_initialized": false,
+  "uploaded": false,
+  "risk_source_prepared": true,
+  "prepare_idempotence_pass": true,
+  "plan_and_report_tests_passed": 10,
+  "independent_build_tested": false,
+  "gpu_inference_tested": false,
+  "files_over_10MiB": [],
+  "excluded_artifacts_found": [],
+  "absolute_symlinks": [],
+  "portable_path_tests_passed": true,
+  "default_plans_no_execution": true,
+  "patches_apply_check_passed": true
+}

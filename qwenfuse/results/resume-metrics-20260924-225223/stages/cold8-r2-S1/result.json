@@ -1,0 +1,148 @@
+{
+  "job": {
+    "id": "cold8-r2-S1",
+    "kind": "model",
+    "variant": "S1",
+    "scenario": "cold8",
+    "seed": 191840815,
+    "round": 2,
+    "verify": false,
+    "samples": 3,
+    "purpose": "control"
+  },
+  "results": [
+    {
+      "batch": 64,
+      "workload_sha256": "b87baa37fadfa559ec68dba2c50bdd5e5e393e0117150a8393908fc850638274",
+      "latency": {
+        "n": 3,
+        "median": 31.39177421400018,
+        "std": 0.516413278080406,
+        "min": 31.259465506998822,
+        "max": 32.21270431300218,
+        "p10": 31.285927248399094,
+        "p90": 32.04851829320178
+      },
+      "throughput": {
+        "n": 3,
+        "median": 521.9201657194968,
+        "std": 8.390043407114074,
+        "min": 508.61920318148645,
+        "max": 524.129243231357,
+        "p10": 511.2793956890885,
+        "p90": 523.687427728985
+      },
+      "preemptions": 0,
+      "cold": {
+        "ttft_s": {
+          "n": 192,
+          "median": 13.243504285812378,
+          "std": 8.859364910614449,
+          "min": 0.3490574359893799,
+          "max": 27.13658833503723,
+          "p10": 1.3448948860168457,
+          "p90": 25.44386751651764
+        },
+        "tpot_s": {
+          "n": 192,
+          "median": 0.029070730778424633,
+          "std": 0.0027066043179312794,
+          "min": 0.019808221368621873,
+          "max": 0.03200609157647705,
+          "p10": 0.023636034072946593,
+          "p90": 0.030359815157644333
+        },
+        "engine_residence_s": {
+          "n": 192,
+          "median": 20.68369415699999,
+          "std": 8.486547246213599,
+          "min": 7.664245734002179,
+          "max": 32.023421615998814,
+          "p10": 8.53718380900209,
+          "p90": 31.127551386999766
+        },
+        "queue_s": {
+          "n": 192,
+          "median": 12.77925582450007,
+          "std": 8.856819593985138,
+          "min": 1.0989999282173812e-05,
+          "max": 26.74176501599868,
+          "p10": 0.8254567796007904,
+          "p90": 24.91888384339982
+        }
+      },
+      "warm_cached_by_sample": [
+        0,
+        0,
+        0
+      ],
+      "warm_cached_by_occurrence": {
+        "0": [
+          0,
+          0,
+          0
+        ],
+        "1": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  ],
+  "native": "/root/data/qwenfuse/reports/resume-metrics-20260924-225223/binaries/A4/_C_stable_libtorch.abi3.so",
+  "native_sha256": "f7627651069590ad5cf2305aa860e5cde2e98064a856eb3db533bb61fe53355f",
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "settings": {
+    "model": "/root/data/qwenfuse/models/Qwen3-8B",
+    "dtype": "bfloat16",
+    "quantization": null,
+    "kv_cache_dtype": "auto",
+    "tensor_parallel_size": 1,
+    "seed": 42,
+    "max_model_len": 4096,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 2048,
+    "block_size": 16,
+    "kv_cache_memory_bytes": 8589934592,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "async_scheduling": false,
+    "scheduling_policy": "fcfs",
+    "enforce_eager": false,
+    "skip_tokenizer_init": true,
+    "generation_config": "vllm",
+    "disable_log_stats": false,
+    "attention_config": {
+      "backend": "FLASH_ATTN",
+      "flash_attn_version": 2
+    },
+    "compilation_config": {
+      "mode": 3,
+      "compile_ranges_endpoints": [
+        256,
+        4096
+      ],
+      "cudagraph_mode": "PIECEWISE",
+      "cudagraph_capture_sizes": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "use_inductor_graph_partition": true,
+      "pass_config": {
+        "enable_qk_norm_rope_fusion": true,
+        "fuse_qk_norm_rope_kvcache": false,
+        "fuse_rope_kvcache": false,
+        "rope_kvcache_fusion_max_token_num": 256
+      }
+    },
+    "cache_aware_admission_window": 16,
+    "cache_aware_admission_threshold": 0.5,
+    "scheduler_cls": "risk_perf_scheduler.RiskPerfScheduler"
+  },
+  "note": "Burst completion wall time; not sustained service throughput. Logits assessed separately. Prefix warmup excluded."
+}

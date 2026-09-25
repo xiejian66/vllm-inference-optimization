@@ -1,0 +1,104 @@
+[
+  {
+    "kind": "micro",
+    "tokens": 1,
+    "variant": "A4",
+    "spread": 0.395951423797121
+  },
+  {
+    "kind": "micro",
+    "tokens": 1,
+    "variant": "B4",
+    "spread": 0.3254620322612666
+  },
+  {
+    "kind": "micro",
+    "tokens": 1,
+    "variant": "C4",
+    "spread": 0.16320472146454387
+  },
+  {
+    "kind": "micro",
+    "tokens": 8,
+    "variant": "A4",
+    "spread": 0.5119912857716957
+  },
+  {
+    "kind": "micro",
+    "tokens": 8,
+    "variant": "C4",
+    "spread": 0.37499998445308247
+  },
+  {
+    "kind": "micro",
+    "tokens": 32,
+    "variant": "A4",
+    "spread": 0.39596526955075195
+  },
+  {
+    "kind": "micro",
+    "tokens": 32,
+    "variant": "B4",
+    "spread": 0.40061157797227537
+  },
+  {
+    "kind": "micro",
+    "tokens": 32,
+    "variant": "C4",
+    "spread": 0.17507413272313743
+  },
+  {
+    "kind": "micro",
+    "tokens": 64,
+    "variant": "A4",
+    "spread": 0.6294755077564498
+  },
+  {
+    "kind": "micro",
+    "tokens": 64,
+    "variant": "B4",
+    "spread": 0.21962615944270195
+  },
+  {
+    "kind": "micro",
+    "tokens": 64,
+    "variant": "C4",
+    "spread": 0.25149707555865997
+  },
+  {
+    "kind": "micro",
+    "tokens": 128,
+    "variant": "A4",
+    "spread": 0.4590061530196218
+  },
+  {
+    "kind": "micro",
+    "tokens": 128,
+    "variant": "B4",
+    "spread": 0.4638202622730006
+  },
+  {
+    "kind": "micro",
+    "tokens": 128,
+    "variant": "C4",
+    "spread": 0.29301875477265643
+  },
+  {
+    "kind": "micro",
+    "tokens": 256,
+    "variant": "A4",
+    "spread": 0.28483494007542437
+  },
+  {
+    "kind": "micro",
+    "tokens": 256,
+    "variant": "B4",
+    "spread": 0.524967955975035
+  },
+  {
+    "kind": "micro",
+    "tokens": 256,
+    "variant": "C4",
+    "spread": 0.17644764917558273
+  }
+]
